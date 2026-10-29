@@ -117,6 +117,22 @@ async function install() {
   fs.writeFileSync(MARKER, JSON.stringify({ requirements: requirementsHash(), date: new Date().toISOString(), gpu }));
 }
 
+// YouTube changes often, and a yt-dlp from install day stops working within weeks or months.
+// So at most once a day, before the engine starts, upgrade it to the newest release. Failing
+// (offline, PyPI down) is harmless: the version already installed is used.
+const YTDLP_STAMP = path.join(ENGINE, "yt-dlp-checked");
+
+async function updateYtDlp() {
+  try { if (Date.now() - fs.statSync(YTDLP_STAMP).mtimeMs < 24 * 3600 * 1000) return; } catch {}
+  step("start", "active", "checking for a newer YouTube downloader");
+  try {
+    await run(UV, ["pip", "install", "--python", PY, "--upgrade", "yt-dlp"], { UV_NO_PROGRESS: "1", UV_HTTP_TIMEOUT: "30" });
+    fs.writeFileSync(YTDLP_STAMP, new Date().toISOString());
+  } catch (e) {
+    log(`(continuing) yt-dlp update skipped: ${e.message}`);
+  }
+}
+
 // ------------------------------------------------------------------ server
 
 function freePort() {
@@ -278,6 +294,7 @@ async function boot() {
       setupWin.webContents.send("first-run");
       await install();
     }
+    await updateYtDlp();
     const port = await startServer();
     createMainWindow(port);
   } catch (err) {

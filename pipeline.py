@@ -1,6 +1,6 @@
 """Pipeline: YouTube URL -> instrumental + synced lyrics.
 
-Stages: download (yt-dlp) -> separate (MDX-Net via audio-separator) -> lyrics (LRCLIB, Whisper fallback)
+Stages: download (yt-dlp) -> separate (MDX-Net / Roformer via audio-separator) -> lyrics (LRCLIB, Whisper fallback)
 -> align (shift LRC timings to match the vocals in this particular video).
 """
 from __future__ import annotations
@@ -203,9 +203,19 @@ SEPARATION_MODELS = {
               "desc": "Removes every vocal, including harmonies.", "speed": "Fast"},
     "hq": {"file": "UVR-MDX-NET-Inst_HQ_3.onnx", "name": "High quality",
            "desc": "Cleanest instrumental with fewer artefacts.", "speed": "Slow"},
+    # Roformer models (run through audio-separator's MDXC architecture). Much better separation than
+    # MDX-Net, but large (hundreds of MB, downloaded on first use) and slow without an NVIDIA GPU.
+    "roformer_karaoke": {"file": "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+                         "name": "Roformer karaoke",
+                         "desc": "Best lead-vocal removal, keeps backing vocals. Needs a GPU to be quick.",
+                         "speed": "Very slow on CPU"},
+    "roformer": {"file": "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "name": "Roformer clean",
+                 "desc": "Best full vocal removal. Needs a GPU to be quick.", "speed": "Very slow on CPU"},
 }
 DEFAULT_MODEL = "karaoke"
 MDX_PARAMS = {"hop_length": 1024, "segment_size": 256, "overlap": 0.1, "batch_size": 1, "enable_denoise": False}
+# Roformer: overlap 2 (the model configs default to 4-8) roughly halves CPU time for a barely audible loss.
+MDXC_PARAMS = {"segment_size": 256, "override_model_segment_size": False, "batch_size": 1, "overlap": 2, "pitch_shift": 0}
 MODEL_DIR = Path(os.environ.get("STAGELIGHT_MODELS") or _HERE / "models")
 _separator = None
 _loaded_model = None
@@ -223,7 +233,7 @@ def separate(mix: Path, stems: Path, model_key: str, report: Report) -> None:
     global _separator, _loaded_model
     if _separator is None:
         _separator = Separator(log_level=logging.WARNING, model_file_dir=str(MODEL_DIR),
-                               output_format="WAV", mdx_params=MDX_PARAMS)
+                               output_format="WAV", mdx_params=MDX_PARAMS, mdxc_params=MDXC_PARAMS)
     if _loaded_model != model_key:
         _separator.load_model(model_filename=SEPARATION_MODELS[model_key]["file"])  # downloads on first use
         _loaded_model = model_key
