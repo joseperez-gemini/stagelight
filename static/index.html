@@ -41,7 +41,6 @@
       Vocal removal: <select id="modelSelect" aria-label="Vocal separation model"></select>
     </label>
     <div id="formError" class="error" hidden></div>
-    <p class="demo-hint">No song handy? <a id="demoLink" href="?demo">Try the demo</a>, it plays instantly.</p>
   </div>
   <div id="results" hidden>
     <div class="lib-head">
@@ -101,6 +100,8 @@
         <div class="line prev" id="lPrev"></div>
         <div class="line cur" id="lCur"></div>
         <div class="line next" id="lNext"></div>
+        <div class="line next ahead" id="lNext2"></div>
+        <div class="line next ahead" id="lNext3"></div>
       </div>
       <div id="countdown"></div>
       <div id="bigPlay"><svg><use href="#i-play"/></svg></div>
@@ -204,6 +205,7 @@
             <button data-value="1">Current</button>
             <button data-value="2">+ Next</button>
             <button data-value="3">All three</button>
+            <button data-value="5" title="Also show the next three lines: handy for fast songs">+3 ahead</button>
           </div>
 
           <div class="row">Position</div>
@@ -238,13 +240,45 @@
           <input id="setMicDelay" class="range" type="range" min="0" max="400" step="10" value="120">
         </section>
 
-        <section class="set-sep">
+        <div class="set-sep">
+        <section id="lyricSource" class="set-source" hidden>
+          <h4>Lyrics for this song</h4>
+          <p id="srcNow" class="hint"></p>
+          <form id="srcSearch" class="src-search">
+            <input id="srcQuery" type="text" placeholder="Artist and song title" aria-label="Search for lyrics" autocomplete="off">
+            <button class="btn ghost small" type="submit">Search</button>
+          </form>
+          <label class="toggle" title="On: shift the lyrics to line up with the singing in this video. Off: use the timings exactly as they come from LRCLIB.">
+            <span>Auto-sync to the vocals</span><input id="srcAutoSync" type="checkbox" checked><i></i>
+          </label>
+          <p id="srcStatus" class="hint src-status" aria-live="polite"></p>
+          <div id="srcList" class="models src-list"></div>
+          <button id="srcWhisper" class="btn ghost small src-whisper" type="button">Transcribe with Whisper instead (slow)</button>
+        </section>
+        <section>
           <h4>Vocal separation</h4>
           <p class="hint">Used for new songs. On this song you can switch to a model that's already processed, or process it again with another one.</p>
           <div id="modelList" class="models"></div>
         </section>
+        <section id="storageSection" class="set-storage">
+          <h4>Song storage</h4>
+          <p class="hint">Where downloaded songs are kept. Takes effect after a restart.</p>
+          <form id="storageForm" class="src-search">
+            <input id="storagePath" type="text" aria-label="Song folder" autocomplete="off" spellcheck="false">
+            <button class="btn ghost small" type="submit">Save</button>
+          </form>
+          <label class="toggle"><span>Move my songs to the new folder</span><input id="storageMove" type="checkbox" checked><i></i></label>
+          <p id="storageStatus" class="hint src-status" aria-live="polite"></p>
+        </section>
+        </div>
 
         <section class="set-keys">
+          <h4>Language</h4>
+          <div class="seg set-lang" data-setting="lang">
+            <button data-value="auto" title="Follow the system language">Auto</button>
+            <button data-value="en" lang="en">English</button>
+            <button data-value="es" lang="es">Español</button>
+          </div>
           <h4>Shortcuts</h4>
           <dl class="keys">
             <dt><kbd>Space</kbd></dt><dd>Play / pause</dd>
@@ -272,6 +306,7 @@
 <audio id="audio" preload="auto"></audio>
 <audio id="vocals" preload="auto"></audio>
 <script src="https://www.youtube.com/iframe_api"></script>
+<script src="i18n.js"></script>
 <script src="app.js"></script>
 <script src="arcade.js"></script>
 </body>

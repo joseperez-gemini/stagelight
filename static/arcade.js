@@ -25,15 +25,15 @@
   // ---------------------------------------------------------------- on / off
 
   async function enable() {
-    if (!song || song.id === "demo") return toast("Arcade needs a real song. Try the built-in one or anything from your library.");
-    if (!navigator.mediaDevices?.getUserMedia) return toast("This browser can't use the microphone here.");
+    if (!song || song.id === "demo") return toast(t("Arcade needs a real song. Pick one from your library."));
+    if (!navigator.mediaDevices?.getUserMedia) return toast(t("This browser can't use the microphone here."));
     try {
       // Echo cancellation keeps the music from the speakers out of the mic as much as it can.
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
       });
     } catch {
-      return toast("Arcade needs your microphone. Allow it for Stagelight in your browser or system settings, then try again.");
+      return toast(t("Arcade needs your microphone. Allow it for Stagelight in your browser or system settings, then try again."));
     }
     ctx = new AudioContext();
     analyser = ctx.createAnalyser();
@@ -49,7 +49,7 @@
     $("arcadeBtn").setAttribute("aria-pressed", "true");
     $("arcadeTop").hidden = false;
     player.classList.add("arcade");
-    toast("Arcade on: sing along and hit the notes! Headphones give the most accurate score.");
+    toast(t("Arcade on: sing along and hit the notes! Headphones give the most accurate score."));
   }
 
   function disable() {
@@ -65,7 +65,7 @@
 
   async function loadMelody(s) {
     if (melodies.has(s.id)) return melodies.get(s.id);
-    if (!s.bundled) toast("Getting the melody ready. The first time takes about half a minute…");
+    if (!s.bundled) toast(t("Getting the melody ready. The first time takes about half a minute…"));
     try {
       const r = await fetch(s.bundled ? `songs/${s.id}/melody.json` : `/api/songs/${s.id}/melody`);
       if (!r.ok) throw new Error();
@@ -75,7 +75,7 @@
       melodies.set(s.id, m);
       return m;
     } catch {
-      toast("Couldn't get the melody for this song, so arcade isn't available for it.");
+      toast(t("Couldn't get the melody for this song, so arcade isn't available for it."));
       return null;
     }
   }
@@ -184,8 +184,8 @@
 
   function showRating(label, points) {
     const el = $("rating");
-    $("ratingText").textContent = label === "Miss" ? "Miss" : `${label}!`;
-    $("ratingPts").textContent = points ? `+${points.toLocaleString("en")}` : "";
+    $("ratingText").textContent = label === "Miss" ? t("Miss") : `${t(label)}!`;
+    $("ratingPts").textContent = points ? `+${points.toLocaleString(LANG)}` : "";
     el.className = `show r-${label.toLowerCase()}`;
     clearTimeout(showRating.timer);
     showRating.timer = setTimeout(() => (el.className = ""), 1100);
@@ -213,8 +213,8 @@
     $("resSong").textContent = song.title;
     $("resRank").textContent = acc >= 0.75 ? "S" : acc >= 0.6 ? "A" : acc >= 0.45 ? "B" : acc >= 0.3 ? "C" : "D";
     $("resStars").textContent = "★".repeat(stars) + "☆".repeat(5 - stars);
-    $("resScore").textContent = score.toLocaleString("en");
-    $("resBest").textContent = record ? (best ? "New best!" : "First score!") : `Best: ${best.toLocaleString("en")}`;
+    $("resScore").textContent = score.toLocaleString(LANG);
+    $("resBest").textContent = record ? t(best ? "New best!" : "First score!") : t("Best: {n}", { n: best.toLocaleString(LANG) });
     $("resAcc").textContent = `${Math.round(acc * 100)}%`;
     $("resCombo").textContent = String(bestCombo);
     $("resPerfect").textContent = String(perfect);
@@ -291,7 +291,7 @@
     // The counter runs up to the score instead of jumping.
     if (shownScore !== score) {
       shownScore = Math.abs(score - shownScore) < 2 ? score : shownScore + (score - shownScore) * 0.15;
-      $("score").textContent = Math.round(shownScore).toLocaleString("en");
+      $("score").textContent = Math.round(shownScore).toLocaleString(LANG);
     }
     $("micLevel").style.width = `${Math.min(100, micRms * 900)}%`;
     draw();

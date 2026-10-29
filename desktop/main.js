@@ -38,6 +38,49 @@ if (!app.requestSingleInstanceLock()) app.quit();
 app.userAgentFallback = app.userAgentFallback.replace(/\sElectron\/\S+/i, "").replace(/\sstagelight\/\S+/i, "");
 app.on("second-instance", () => { const w = mainWin || setupWin; if (w) { if (w.isMinimized()) w.restore(); w.focus(); } });
 
+// ------------------------------------------------------------------ language
+
+// The app shell (setup screen, menu, dialogs) follows the language chosen in Stagelight's settings,
+// which the engine saves in config.json, or else the system language.
+const CONFIG = path.join(HOME, "config.json");
+const readConfig = () => { try { return JSON.parse(fs.readFileSync(CONFIG, "utf8")) || {}; } catch { return {}; } };
+let LANG = "en";
+const uiLang = () => {
+  const chosen = readConfig().lang;
+  if (chosen === "en" || chosen === "es") return chosen;
+  return /^es\b/i.test(app.getLocale()) ? "es" : "en";
+};
+const ES = {
+  "Couldn't download Python. Check your internet connection and try again.":
+    "No se pudo descargar Python. Comprueba tu conexión a internet y vuelve a intentarlo.",
+  "about 3 GB with NVIDIA GPU support, this is the long part": "unos 3 GB con soporte para GPU NVIDIA, esta es la parte larga",
+  "about 700 MB, this is the long part": "unos 700 MB, esta es la parte larga",
+  "checking for a newer YouTube downloader": "buscando una versión más nueva del descargador de YouTube",
+  "loading the AI models": "cargando los modelos de IA",
+  "Stagelight stopped": "Stagelight se ha detenido",
+  "The Stagelight engine stopped unexpectedly (code {code}).\nLog: {log}":
+    "El motor de Stagelight se detuvo inesperadamente (código {code}).\nRegistro: {log}",
+  "The Stagelight engine stopped while starting. See the log.": "El motor de Stagelight se detuvo al arrancar. Mira el registro.",
+  "The Stagelight engine took too long to start.": "El motor de Stagelight tardó demasiado en arrancar.",
+  "File": "Archivo",
+  "Open in Your Browser": "Abrir en tu navegador",
+  "Open Songs Folder": "Abrir la carpeta de canciones",
+  "Show Log": "Ver el registro",
+  "Reinstall AI Engine…": "Reinstalar el motor de IA…",
+  "View": "Ver",
+  "Stagelight on GitHub": "Stagelight en GitHub",
+  "Reinstall": "Reinstalar",
+  "Cancel": "Cancelar",
+  "Reinstall the AI engine?": "¿Reinstalar el motor de IA?",
+  "Your songs are kept. Stagelight restarts and downloads the engine again.":
+    "Tus canciones se conservan. Stagelight se reinicia y vuelve a descargar el motor.",
+  "Stagelight needs a Mac with Apple Silicon (M1 or newer). Intel Macs aren't supported yet, because the AI library it uses no longer has builds for them.":
+    "Stagelight necesita un Mac con Apple Silicon (M1 o posterior). Los Mac con Intel aún no son compatibles, porque la librería de IA que usa ya no tiene versiones para ellos.",
+};
+const tr = (s, vars = {}) => ((LANG === "es" && ES[s]) || s).replace(/\{(\w+)\}/g, (m, k) => (k in vars ? vars[k] : m));
+// Where the songs are: the folder chosen in settings, or the default one.
+const songsDir = () => readConfig().dataDir || path.join(HOME, "data");
+
 function log(line) {
   fs.appendFileSync(LOG, `[${new Date().toISOString()}] ${line}\n`);
   setupWin?.webContents.send("log", line);
@@ -97,17 +140,21 @@ async function install() {
   // the interpreter it unpacked ourselves, and hand `uv venv` the exact path.
   await run(UV, ["python", "install", "3.12"], uvEnv).catch((e) => log(`(continuing) ${e.message}`));
   const interpreter = findManagedPython();
-  if (!interpreter) throw new Error("Couldn't download Python. Check your internet connection and try again.");
+  if (!interpreter) throw new Error(tr("Couldn't download Python. Check your internet connection and try again."));
   log(`using ${interpreter}`);
   if (fs.existsSync(VENV)) fs.rmSync(VENV, { recursive: true, force: true });
   await run(UV, ["venv", "--python", interpreter, VENV], uvEnv);
   step("python", "done");
 
-  step("packages", "active", "about 700 MB, this is the long part");
   const args = ["pip", "install", "--python", PY, "-r", path.join(APP_DIR, "requirements.txt"),
                 "--index-strategy", "unsafe-best-match"];
   const gpu = process.platform !== "darwin" && (await hasNvidia());
+  // PyTorch on PyPI is CPU-only for Windows; NVIDIA builds come from PyTorch's own index. (On Linux
+  // the PyPI build already includes CUDA.) Without an NVIDIA card, take the smaller CPU-only build.
   if (process.platform !== "darwin" && !gpu) args.push("--extra-index-url", "https://download.pytorch.org/whl/cpu");
+  if (isWin && gpu) args.push("--extra-index-url", "https://download.pytorch.org/whl/cu124");
+  step("packages", "active", tr(gpu ? "about 3 GB with NVIDIA GPU support, this is the long part"
+                                    : "about 700 MB, this is the long part"));
   await run(UV, args, uvEnv);
   // audio-separator without its own dependency list: it would pull in diffq, which can't be
   // installed on macOS (see requirements.txt).
@@ -124,7 +171,7 @@ const YTDLP_STAMP = path.join(ENGINE, "yt-dlp-checked");
 
 async function updateYtDlp() {
   try { if (Date.now() - fs.statSync(YTDLP_STAMP).mtimeMs < 24 * 3600 * 1000) return; } catch {}
-  step("start", "active", "checking for a newer YouTube downloader");
+  step("start", "active", tr("checking for a newer YouTube downloader"));
   try {
     await run(UV, ["pip", "install", "--python", PY, "--upgrade", "yt-dlp"], { UV_NO_PROGRESS: "1", UV_HTTP_TIMEOUT: "30" });
     fs.writeFileSync(YTDLP_STAMP, new Date().toISOString());
@@ -155,8 +202,8 @@ function waitForServer(port, timeoutMs = 180000) {
       req.on("timeout", () => { req.destroy(); retry(); });
     };
     const retry = () => {
-      if (!server || server.exitCode !== null) return reject(new Error("The Stagelight engine stopped while starting. See the log."));
-      if (Date.now() > until) return reject(new Error("The Stagelight engine took too long to start."));
+      if (!server || server.exitCode !== null) return reject(new Error(tr("The Stagelight engine stopped while starting. See the log.")));
+      if (Date.now() > until) return reject(new Error(tr("The Stagelight engine took too long to start.")));
       setTimeout(tryOnce, 500);
     };
     tryOnce();
@@ -164,7 +211,7 @@ function waitForServer(port, timeoutMs = 180000) {
 }
 
 async function startServer() {
-  step("start", "active", "loading the AI models");
+  step("start", "active", tr("loading the AI models"));
   const port = await freePort();
   server = spawn(PY, ["-m", "uvicorn", "server:app", "--app-dir", APP_DIR, "--host", "127.0.0.1", "--port", String(port),
                       "--no-access-log"], {
@@ -174,6 +221,7 @@ async function startServer() {
       ...process.env,
       PYTHONUNBUFFERED: "1",
       STAGELIGHT_DATA: path.join(HOME, "data"),
+      STAGELIGHT_CONFIG: CONFIG,
       STAGELIGHT_MODELS: path.join(HOME, "models"),
       STAGELIGHT_BIN: path.join(HOME, "bin"),
       // yt-dlp runs this as `node --version` / `node script.js`; with this flag Electron behaves as Node.
@@ -187,7 +235,7 @@ async function startServer() {
   server.on("exit", (code) => {
     log(`engine exited with code ${code}`);
     if (!quitting && mainWin) {
-      dialog.showErrorBox("Stagelight stopped", `The Stagelight engine stopped unexpectedly (code ${code}).\nLog: ${LOG}`);
+      dialog.showErrorBox(tr("Stagelight stopped"), tr("The Stagelight engine stopped unexpectedly (code {code}).\nLog: {log}", { code, log: LOG }));
       app.quit();
     }
   });
@@ -211,7 +259,7 @@ function createSetupWindow() {
     autoHideMenuBar: true, show: false, icon: ICON,
     webPreferences: { preload: path.join(__dirname, "preload.js") },
   });
-  setupWin.loadFile(path.join(__dirname, "setup.html"));
+  setupWin.loadFile(path.join(__dirname, "setup.html"), { query: { lang: LANG } });
   setupWin.once("ready-to-show", () => setupWin.show());
   setupWin.on("closed", () => { setupWin = null; if (!mainWin) app.quit(); });
   return new Promise((resolve) => setupWin.webContents.once("did-finish-load", resolve));
@@ -226,6 +274,8 @@ function openInBrowser(pathAndQuery = "/") {
   shell.openExternal(`http://127.0.0.1:${serverPort}${p}`);
 }
 ipcMain.on("open-in-browser", (_e, p) => openInBrowser(p));
+// After the song folder is changed in Settings: restart so the engine opens (and moves) it.
+ipcMain.on("restart", () => { app.relaunch(); app.quit(); });
 
 function createMainWindow(port) {
   serverPort = port;
@@ -247,30 +297,30 @@ function createMainWindow(port) {
 function buildMenu() {
   const template = [
     ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
-    { label: "File", submenu: [
-      { label: "Open in Your Browser", click: () => {
+    { label: tr("File"), submenu: [
+      { label: tr("Open in Your Browser"), click: () => {
         // Keep the current song: pass the window's path and query along.
         const u = mainWin ? new URL(mainWin.webContents.getURL()) : null;
         openInBrowser(u ? u.pathname + u.search : "/");
       } },
-      { label: "Open Songs Folder", click: () => shell.openPath(path.join(HOME, "data")) },
-      { label: "Show Log", click: () => shell.openPath(LOG) },
+      { label: tr("Open Songs Folder"), click: () => shell.openPath(songsDir()) },
+      { label: tr("Show Log"), click: () => shell.openPath(LOG) },
       { type: "separator" },
-      { label: "Reinstall AI Engine…", click: reinstall },
+      { label: tr("Reinstall AI Engine…"), click: reinstall },
       { type: "separator" },
       process.platform === "darwin" ? { role: "close" } : { role: "quit" },
     ] },
     { role: "editMenu" },
-    { label: "View", submenu: [{ role: "reload" }, { role: "togglefullscreen" }, { type: "separator" }, { role: "toggleDevTools" }] },
-    { role: "help", submenu: [{ label: "Stagelight on GitHub", click: () => shell.openExternal("https://github.com/bartoszkolo/stagelight") }] },
+    { label: tr("View"), submenu: [{ role: "reload" }, { role: "togglefullscreen" }, { type: "separator" }, { role: "toggleDevTools" }] },
+    { role: "help", submenu: [{ label: tr("Stagelight on GitHub"), click: () => shell.openExternal("https://github.com/bartoszkolo/stagelight") }] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 async function reinstall() {
   const { response } = await dialog.showMessageBox({
-    type: "question", buttons: ["Reinstall", "Cancel"], defaultId: 1,
-    message: "Reinstall the AI engine?", detail: "Your songs are kept. Stagelight restarts and downloads the engine again.",
+    type: "question", buttons: [tr("Reinstall"), tr("Cancel")], defaultId: 1,
+    message: tr("Reinstall the AI engine?"), detail: tr("Your songs are kept. Stagelight restarts and downloads the engine again."),
   });
   if (response !== 0) return;
   try { fs.rmSync(MARKER, { force: true }); } catch {}
@@ -285,8 +335,8 @@ async function boot() {
   try {
     // PyTorch no longer ships builds for Intel Macs, so the AI engine can't be installed there.
     if (process.platform === "darwin" && process.arch === "x64" && !app.runningUnderARM64Translation) {
-      throw new Error("Stagelight needs a Mac with Apple Silicon (M1 or newer). Intel Macs aren't supported "
-        + "yet, because the AI library it uses no longer has builds for them.");
+      throw new Error(tr("Stagelight needs a Mac with Apple Silicon (M1 or newer). Intel Macs aren't supported "
+        + "yet, because the AI library it uses no longer has builds for them."));
     }
     if (isInstalled()) {
       step("python", "done"); step("packages", "done");
@@ -313,6 +363,7 @@ ipcMain.on("open-log", () => shell.openPath(LOG));
 
 app.whenReady().then(() => {
   fs.mkdirSync(HOME, { recursive: true });
+  LANG = uiLang();
   buildMenu();
   boot();
 });

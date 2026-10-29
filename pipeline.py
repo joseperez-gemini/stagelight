@@ -22,7 +22,53 @@ import soundfile as sf
 
 # The desktop app installs the code read-only and points these at the user's app-data folder.
 _HERE = Path(__file__).parent
-DATA = Path(os.environ.get("STAGELIGHT_DATA") or _HERE / "data")
+# Settings needed before the server starts, such as where the songs live (chosen in Settings).
+# The desktop app keeps this file with its other app data; the web version next to this file.
+CONFIG = Path(os.environ.get("STAGELIGHT_CONFIG") or _HERE / "config.json")
+DEFAULT_DATA = Path(os.environ.get("STAGELIGHT_DATA") or _HERE / "data")
+
+
+def read_config() -> dict:
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _data_dir() -> Path:
+    custom = read_config().get("dataDir")
+    if custom:
+        try:
+            Path(custom).mkdir(parents=True, exist_ok=True)
+            return Path(custom)
+        except OSError:  # e.g. an external drive that isn't plugged in right now
+            print(f"Can't use the song folder {custom}; using {DEFAULT_DATA} for now", flush=True)
+    return DEFAULT_DATA
+
+
+DATA = _data_dir()
+
+
+def apply_pending_move() -> None:
+    """After the song folder was changed with "move my songs": move them over, before anything
+    else opens them. Songs already present in the new folder are left where they were."""
+    cfg = read_config()
+    src = cfg.pop("moveFrom", None)
+    if src is None:
+        return
+    src = Path(src)
+    if src.is_dir() and src.resolve() != DATA.resolve():
+        for item in list(src.iterdir()):
+            target = DATA / item.name
+            if target.exists():
+                continue
+            try:
+                shutil.move(str(item), str(target))
+            except OSError as e:
+                print(f"Couldn't move {item} to {target}: {e}", flush=True)
+        print(f"Moved songs from {src} to {DATA}", flush=True)
+    write_json(CONFIG, cfg)
 
 # audio-separator / pydub look for a plain "ffmpeg" on PATH. Use the system one if there is one,
 # otherwise expose the binary bundled with imageio-ffmpeg under that name.
@@ -221,6 +267,23 @@ _separator = None
 _loaded_model = None
 
 
+def _on_gpu(sep) -> bool:
+    return str(sep.torch_device) != "cpu"
+
+
+def _fall_back_to_cpu(sep, model_file: str, error: Exception) -> None:
+    """The GPU failed (out of memory, old driver, unsupported card): finish on the CPU instead.
+    The switch lasts until the app restarts, so later songs don't fail on the GPU first."""
+    import torch
+
+    print(f"GPU separation failed ({type(error).__name__}: {error}); falling back to the CPU", flush=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    sep.torch_device = sep.torch_device_cpu
+    sep.onnx_execution_provider = ["CPUExecutionProvider"]
+    sep.load_model(model_filename=model_file, force_reload=True)
+
+
 def separate(mix: Path, stems: Path, model_key: str, report: Report) -> None:
     report("separate", None)  # before the imports: they alone take a few seconds
     import logging
@@ -234,8 +297,14 @@ def separate(mix: Path, stems: Path, model_key: str, report: Report) -> None:
     if _separator is None:
         _separator = Separator(log_level=logging.WARNING, model_file_dir=str(MODEL_DIR),
                                output_format="WAV", mdx_params=MDX_PARAMS, mdxc_params=MDXC_PARAMS)
+    model_file = SEPARATION_MODELS[model_key]["file"]
     if _loaded_model != model_key:
-        _separator.load_model(model_filename=SEPARATION_MODELS[model_key]["file"])  # downloads on first use
+        try:
+            _separator.load_model(model_filename=model_file)  # downloads on first use
+        except Exception as e:
+            if not _on_gpu(_separator):
+                raise
+            _fall_back_to_cpu(_separator, model_file, e)
         _loaded_model = model_key
 
     # The models loop over chunks with tqdm; swap it for one that feeds our progress bar.
@@ -259,7 +328,17 @@ def separate(mix: Path, stems: Path, model_key: str, report: Report) -> None:
     try:
         _separator.output_dir = _separator.model_instance.output_dir = str(work)
         names = {"Vocals": "vocals", "Instrumental": "instrumental", "Other": "instrumental"}
-        files = [work / Path(f).name for f in _separator.separate(str(mix), names)]
+        try:
+            outputs = _separator.separate(str(mix), names)
+        except Exception as e:
+            if not _on_gpu(_separator):
+                raise
+            _fall_back_to_cpu(_separator, model_file, e)
+            _separator.output_dir = _separator.model_instance.output_dir = str(work)
+            state["done"] = 0.0
+            report("separate", None)
+            outputs = _separator.separate(str(mix), names)
+        files = [work / Path(f).name for f in outputs]
         vocal = next((f for f in files if "vocal" in f.stem.lower()), None)
         inst = next((f for f in files if f != vocal), None)
         if not vocal or not inst:
@@ -327,9 +406,21 @@ def _similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
 
 
+LRCLIB_API = "https://lrclib.net/api"
+LRCLIB_HEADERS = {"User-Agent": "Stagelight karaoke (https://github.com/bartoszkolo/stagelight)"}
+
+
+def _lrclib_score(x: dict, artist: str, title: str, duration: float) -> float:
+    s = 2 * _similar(x.get("trackName"), title) + _similar(x.get("artistName"), artist)
+    d = (x.get("duration") or 0) - duration
+    # Music videos are often longer than the album track (intros, outros), rarely shorter.
+    s -= 0.02 * max(0, abs(d) - 3) * (0.5 if d < 0 else 1.5)
+    return s
+
+
 def fetch_lrclib(artist: str, title: str, duration: float) -> dict | None:
-    headers = {"User-Agent": "Stagelight karaoke (https://github.com/bartoszkolo/stagelight)"}
-    api = "https://lrclib.net/api"
+    headers = LRCLIB_HEADERS
+    api = LRCLIB_API
     with httpx.Client(timeout=15, headers=headers) as c:
         # Exact lookup first (matches duration within ~2 s), then progressively looser searches.
         r = c.get(f"{api}/get", params={"artist_name": artist, "track_name": title, "duration": round(duration)})
@@ -344,15 +435,40 @@ def fetch_lrclib(artist: str, title: str, duration: float) -> dict | None:
             if results:
                 break
 
-    def score(x):
-        s = 2 * _similar(x.get("trackName"), title) + _similar(x.get("artistName"), artist)
-        d = (x.get("duration") or 0) - duration
-        # Music videos are often longer than the album track (intros, outros), rarely shorter.
-        s -= 0.02 * max(0, abs(d) - 3) * (0.5 if d < 0 else 1.5)
-        return s
-
     results = [x for x in results if _similar(x.get("trackName"), title) > 0.5]
-    return max(results, key=score) if results else None
+    return max(results, key=lambda x: _lrclib_score(x, artist, title, duration)) if results else None
+
+
+def lrclib_candidates(artist: str, title: str, duration: float, query: str | None = None,
+                      limit: int = 15) -> list[dict]:
+    """Every timed LRCLIB version of a song, best match first, for picking another one by hand.
+    With `query`, a free-text search instead (for when the artist or title was guessed wrong)."""
+    searches = ([{"q": query}] if query else
+                [{"artist_name": artist, "track_name": title}, {"track_name": title}, {"q": f"{artist} {title}"}])
+    found: dict[int, dict] = {}
+    with httpx.Client(timeout=15, headers=LRCLIB_HEADERS) as c:
+        for params in searches:
+            r = c.get(f"{LRCLIB_API}/search", params=params)
+            if r.status_code == 200:
+                for x in r.json():
+                    if x.get("syncedLyrics") and not x.get("instrumental"):
+                        found.setdefault(x["id"], x)
+    ranked = list(found.values())
+    if not query:  # a free-text search keeps LRCLIB's own order
+        ranked.sort(key=lambda x: _lrclib_score(x, artist, title, duration), reverse=True)
+    out = []
+    for x in ranked[:limit]:
+        first = [ln["text"] for ln in parse_lrc(x["syncedLyrics"])[:2]]
+        out.append({"id": x["id"], "artist": x.get("artistName"), "title": x.get("trackName"),
+                    "album": x.get("albumName"), "duration": x.get("duration"), "preview": " / ".join(first)})
+    return out
+
+
+def lrclib_get(lyrics_id: int) -> dict:
+    with httpx.Client(timeout=15, headers=LRCLIB_HEADERS) as c:
+        r = c.get(f"{LRCLIB_API}/get/{int(lyrics_id)}")
+        r.raise_for_status()
+        return r.json()
 
 
 _TS = re.compile(r"\[(\d+):(\d+)(?:[.:](\d+))?\]")
@@ -593,13 +709,44 @@ def process(url: str, model_key: str, report: Report) -> dict:
         offset = best_offset(lines, vocal_envelope(vocals))
         source = "lrclib"
         artist, title = found.get("artistName") or artist, found.get("trackName") or title
+        lrclib_id = found.get("id")
     else:
         lines = transcribe(vocals, report)
         source = "whisper"
+        lrclib_id = None
 
     result = {
         "id": vid, "artist": artist, "title": title, "videoTitle": meta["title"],
-        "source": source, "offset": offset, "lines": lines,
+        "source": source, "offset": offset, "lines": lines, "lrclibId": lrclib_id, "autoSync": True,
     }
     write_json(result_path, result)
     return load_result(vid)
+
+
+def choose_lyrics(vid: str, source: str, lyrics_id: int | None = None, auto_sync: bool = True) -> dict:
+    """Different lyrics for a processed song: another LRCLIB version (auto-synced to the vocals, or
+    with LRCLIB's own timings as they are) or a Whisper transcription. Returns the result.json fields
+    to change; the caller writes them."""
+    out = DATA / vid
+    vocals = next(iter(sorted((out / "stems").glob("*/vocals.wav"))), None)
+    if source == "lrclib":
+        if lyrics_id is None:
+            raise ValueError("Pick which lyrics to use")
+        found = lrclib_get(lyrics_id)
+        if not found.get("syncedLyrics"):
+            raise ValueError("Those lyrics have no timings")
+        lines = parse_lrc(found["syncedLyrics"])
+        synced = bool(auto_sync and vocals)
+        update = {"source": "lrclib", "lrclibId": found.get("id"), "autoSync": synced, "lines": lines,
+                  "offset": best_offset(lines, vocal_envelope(vocals)) if synced else 0.0}
+        if found.get("artistName"):
+            update["artist"] = found["artistName"]
+        if found.get("trackName"):
+            update["title"] = found["trackName"]
+        return update
+    if source == "whisper":
+        if not vocals:
+            raise ValueError("This song has no separated vocals to listen to")
+        return {"source": "whisper", "lrclibId": None, "lines": transcribe(vocals, lambda *a, **k: None),
+                "offset": 0.0}
+    raise ValueError(f"Unknown lyrics source: {source}")

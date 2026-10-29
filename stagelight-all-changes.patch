@@ -1,0 +1,1908 @@
+diff --git a/desktop/main.js b/desktop/main.js
+index b243b30..abe120d 100644
+--- a/desktop/main.js
++++ b/desktop/main.js
+@@ -38,6 +38,49 @@ if (!app.requestSingleInstanceLock()) app.quit();
+ app.userAgentFallback = app.userAgentFallback.replace(/\sElectron\/\S+/i, "").replace(/\sstagelight\/\S+/i, "");
+ app.on("second-instance", () => { const w = mainWin || setupWin; if (w) { if (w.isMinimized()) w.restore(); w.focus(); } });
+ 
++// ------------------------------------------------------------------ language
++
++// The app shell (setup screen, menu, dialogs) follows the language chosen in Stagelight's settings,
++// which the engine saves in config.json, or else the system language.
++const CONFIG = path.join(HOME, "config.json");
++const readConfig = () => { try { return JSON.parse(fs.readFileSync(CONFIG, "utf8")) || {}; } catch { return {}; } };
++let LANG = "en";
++const uiLang = () => {
++  const chosen = readConfig().lang;
++  if (chosen === "en" || chosen === "es") return chosen;
++  return /^es\b/i.test(app.getLocale()) ? "es" : "en";
++};
++const ES = {
++  "Couldn't download Python. Check your internet connection and try again.":
++    "No se pudo descargar Python. Comprueba tu conexión a internet y vuelve a intentarlo.",
++  "about 3 GB with NVIDIA GPU support, this is the long part": "unos 3 GB con soporte para GPU NVIDIA, esta es la parte larga",
++  "about 700 MB, this is the long part": "unos 700 MB, esta es la parte larga",
++  "checking for a newer YouTube downloader": "buscando una versión más nueva del descargador de YouTube",
++  "loading the AI models": "cargando los modelos de IA",
++  "Stagelight stopped": "Stagelight se ha detenido",
++  "The Stagelight engine stopped unexpectedly (code {code}).\nLog: {log}":
++    "El motor de Stagelight se detuvo inesperadamente (código {code}).\nRegistro: {log}",
++  "The Stagelight engine stopped while starting. See the log.": "El motor de Stagelight se detuvo al arrancar. Mira el registro.",
++  "The Stagelight engine took too long to start.": "El motor de Stagelight tardó demasiado en arrancar.",
++  "File": "Archivo",
++  "Open in Your Browser": "Abrir en tu navegador",
++  "Open Songs Folder": "Abrir la carpeta de canciones",
++  "Show Log": "Ver el registro",
++  "Reinstall AI Engine…": "Reinstalar el motor de IA…",
++  "View": "Ver",
++  "Stagelight on GitHub": "Stagelight en GitHub",
++  "Reinstall": "Reinstalar",
++  "Cancel": "Cancelar",
++  "Reinstall the AI engine?": "¿Reinstalar el motor de IA?",
++  "Your songs are kept. Stagelight restarts and downloads the engine again.":
++    "Tus canciones se conservan. Stagelight se reinicia y vuelve a descargar el motor.",
++  "Stagelight needs a Mac with Apple Silicon (M1 or newer). Intel Macs aren't supported yet, because the AI library it uses no longer has builds for them.":
++    "Stagelight necesita un Mac con Apple Silicon (M1 o posterior). Los Mac con Intel aún no son compatibles, porque la librería de IA que usa ya no tiene versiones para ellos.",
++};
++const tr = (s, vars = {}) => ((LANG === "es" && ES[s]) || s).replace(/\{(\w+)\}/g, (m, k) => (k in vars ? vars[k] : m));
++// Where the songs are: the folder chosen in settings, or the default one.
++const songsDir = () => readConfig().dataDir || path.join(HOME, "data");
++
+ function log(line) {
+   fs.appendFileSync(LOG, `[${new Date().toISOString()}] ${line}\n`);
+   setupWin?.webContents.send("log", line);
+@@ -97,17 +140,21 @@ async function install() {
+   // the interpreter it unpacked ourselves, and hand `uv venv` the exact path.
+   await run(UV, ["python", "install", "3.12"], uvEnv).catch((e) => log(`(continuing) ${e.message}`));
+   const interpreter = findManagedPython();
+-  if (!interpreter) throw new Error("Couldn't download Python. Check your internet connection and try again.");
++  if (!interpreter) throw new Error(tr("Couldn't download Python. Check your internet connection and try again."));
+   log(`using ${interpreter}`);
+   if (fs.existsSync(VENV)) fs.rmSync(VENV, { recursive: true, force: true });
+   await run(UV, ["venv", "--python", interpreter, VENV], uvEnv);
+   step("python", "done");
+ 
+-  step("packages", "active", "about 700 MB, this is the long part");
+   const args = ["pip", "install", "--python", PY, "-r", path.join(APP_DIR, "requirements.txt"),
+                 "--index-strategy", "unsafe-best-match"];
+   const gpu = process.platform !== "darwin" && (await hasNvidia());
++  // PyTorch on PyPI is CPU-only for Windows; NVIDIA builds come from PyTorch's own index. (On Linux
++  // the PyPI build already includes CUDA.) Without an NVIDIA card, take the smaller CPU-only build.
+   if (process.platform !== "darwin" && !gpu) args.push("--extra-index-url", "https://download.pytorch.org/whl/cpu");
++  if (isWin && gpu) args.push("--extra-index-url", "https://download.pytorch.org/whl/cu124");
++  step("packages", "active", tr(gpu ? "about 3 GB with NVIDIA GPU support, this is the long part"
++                                    : "about 700 MB, this is the long part"));
+   await run(UV, args, uvEnv);
+   // audio-separator without its own dependency list: it would pull in diffq, which can't be
+   // installed on macOS (see requirements.txt).
+@@ -124,7 +171,7 @@ const YTDLP_STAMP = path.join(ENGINE, "yt-dlp-checked");
+ 
+ async function updateYtDlp() {
+   try { if (Date.now() - fs.statSync(YTDLP_STAMP).mtimeMs < 24 * 3600 * 1000) return; } catch {}
+-  step("start", "active", "checking for a newer YouTube downloader");
++  step("start", "active", tr("checking for a newer YouTube downloader"));
+   try {
+     await run(UV, ["pip", "install", "--python", PY, "--upgrade", "yt-dlp"], { UV_NO_PROGRESS: "1", UV_HTTP_TIMEOUT: "30" });
+     fs.writeFileSync(YTDLP_STAMP, new Date().toISOString());
+@@ -155,8 +202,8 @@ function waitForServer(port, timeoutMs = 180000) {
+       req.on("timeout", () => { req.destroy(); retry(); });
+     };
+     const retry = () => {
+-      if (!server || server.exitCode !== null) return reject(new Error("The Stagelight engine stopped while starting. See the log."));
+-      if (Date.now() > until) return reject(new Error("The Stagelight engine took too long to start."));
++      if (!server || server.exitCode !== null) return reject(new Error(tr("The Stagelight engine stopped while starting. See the log.")));
++      if (Date.now() > until) return reject(new Error(tr("The Stagelight engine took too long to start.")));
+       setTimeout(tryOnce, 500);
+     };
+     tryOnce();
+@@ -164,7 +211,7 @@ function waitForServer(port, timeoutMs = 180000) {
+ }
+ 
+ async function startServer() {
+-  step("start", "active", "loading the AI models");
++  step("start", "active", tr("loading the AI models"));
+   const port = await freePort();
+   server = spawn(PY, ["-m", "uvicorn", "server:app", "--app-dir", APP_DIR, "--host", "127.0.0.1", "--port", String(port),
+                       "--no-access-log"], {
+@@ -174,6 +221,7 @@ async function startServer() {
+       ...process.env,
+       PYTHONUNBUFFERED: "1",
+       STAGELIGHT_DATA: path.join(HOME, "data"),
++      STAGELIGHT_CONFIG: CONFIG,
+       STAGELIGHT_MODELS: path.join(HOME, "models"),
+       STAGELIGHT_BIN: path.join(HOME, "bin"),
+       // yt-dlp runs this as `node --version` / `node script.js`; with this flag Electron behaves as Node.
+@@ -187,7 +235,7 @@ async function startServer() {
+   server.on("exit", (code) => {
+     log(`engine exited with code ${code}`);
+     if (!quitting && mainWin) {
+-      dialog.showErrorBox("Stagelight stopped", `The Stagelight engine stopped unexpectedly (code ${code}).\nLog: ${LOG}`);
++      dialog.showErrorBox(tr("Stagelight stopped"), tr("The Stagelight engine stopped unexpectedly (code {code}).\nLog: {log}", { code, log: LOG }));
+       app.quit();
+     }
+   });
+@@ -211,7 +259,7 @@ function createSetupWindow() {
+     autoHideMenuBar: true, show: false, icon: ICON,
+     webPreferences: { preload: path.join(__dirname, "preload.js") },
+   });
+-  setupWin.loadFile(path.join(__dirname, "setup.html"));
++  setupWin.loadFile(path.join(__dirname, "setup.html"), { query: { lang: LANG } });
+   setupWin.once("ready-to-show", () => setupWin.show());
+   setupWin.on("closed", () => { setupWin = null; if (!mainWin) app.quit(); });
+   return new Promise((resolve) => setupWin.webContents.once("did-finish-load", resolve));
+@@ -226,6 +274,8 @@ function openInBrowser(pathAndQuery = "/") {
+   shell.openExternal(`http://127.0.0.1:${serverPort}${p}`);
+ }
+ ipcMain.on("open-in-browser", (_e, p) => openInBrowser(p));
++// After the song folder is changed in Settings: restart so the engine opens (and moves) it.
++ipcMain.on("restart", () => { app.relaunch(); app.quit(); });
+ 
+ function createMainWindow(port) {
+   serverPort = port;
+@@ -247,30 +297,30 @@ function createMainWindow(port) {
+ function buildMenu() {
+   const template = [
+     ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
+-    { label: "File", submenu: [
+-      { label: "Open in Your Browser", click: () => {
++    { label: tr("File"), submenu: [
++      { label: tr("Open in Your Browser"), click: () => {
+         // Keep the current song: pass the window's path and query along.
+         const u = mainWin ? new URL(mainWin.webContents.getURL()) : null;
+         openInBrowser(u ? u.pathname + u.search : "/");
+       } },
+-      { label: "Open Songs Folder", click: () => shell.openPath(path.join(HOME, "data")) },
+-      { label: "Show Log", click: () => shell.openPath(LOG) },
++      { label: tr("Open Songs Folder"), click: () => shell.openPath(songsDir()) },
++      { label: tr("Show Log"), click: () => shell.openPath(LOG) },
+       { type: "separator" },
+-      { label: "Reinstall AI Engine…", click: reinstall },
++      { label: tr("Reinstall AI Engine…"), click: reinstall },
+       { type: "separator" },
+       process.platform === "darwin" ? { role: "close" } : { role: "quit" },
+     ] },
+     { role: "editMenu" },
+-    { label: "View", submenu: [{ role: "reload" }, { role: "togglefullscreen" }, { type: "separator" }, { role: "toggleDevTools" }] },
+-    { role: "help", submenu: [{ label: "Stagelight on GitHub", click: () => shell.openExternal("https://github.com/bartoszkolo/stagelight") }] },
++    { label: tr("View"), submenu: [{ role: "reload" }, { role: "togglefullscreen" }, { type: "separator" }, { role: "toggleDevTools" }] },
++    { role: "help", submenu: [{ label: tr("Stagelight on GitHub"), click: () => shell.openExternal("https://github.com/bartoszkolo/stagelight") }] },
+   ];
+   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+ }
+ 
+ async function reinstall() {
+   const { response } = await dialog.showMessageBox({
+-    type: "question", buttons: ["Reinstall", "Cancel"], defaultId: 1,
+-    message: "Reinstall the AI engine?", detail: "Your songs are kept. Stagelight restarts and downloads the engine again.",
++    type: "question", buttons: [tr("Reinstall"), tr("Cancel")], defaultId: 1,
++    message: tr("Reinstall the AI engine?"), detail: tr("Your songs are kept. Stagelight restarts and downloads the engine again."),
+   });
+   if (response !== 0) return;
+   try { fs.rmSync(MARKER, { force: true }); } catch {}
+@@ -285,8 +335,8 @@ async function boot() {
+   try {
+     // PyTorch no longer ships builds for Intel Macs, so the AI engine can't be installed there.
+     if (process.platform === "darwin" && process.arch === "x64" && !app.runningUnderARM64Translation) {
+-      throw new Error("Stagelight needs a Mac with Apple Silicon (M1 or newer). Intel Macs aren't supported "
+-        + "yet, because the AI library it uses no longer has builds for them.");
++      throw new Error(tr("Stagelight needs a Mac with Apple Silicon (M1 or newer). Intel Macs aren't supported "
++        + "yet, because the AI library it uses no longer has builds for them."));
+     }
+     if (isInstalled()) {
+       step("python", "done"); step("packages", "done");
+@@ -313,6 +363,7 @@ ipcMain.on("open-log", () => shell.openPath(LOG));
+ 
+ app.whenReady().then(() => {
+   fs.mkdirSync(HOME, { recursive: true });
++  LANG = uiLang();
+   buildMenu();
+   boot();
+ });
+diff --git a/desktop/preload-main.js b/desktop/preload-main.js
+index 5cc6db1..0d2726d 100644
+--- a/desktop/preload-main.js
++++ b/desktop/preload-main.js
+@@ -5,4 +5,5 @@ const { contextBridge, ipcRenderer } = require("electron");
+ 
+ contextBridge.exposeInMainWorld("stagelightDesktop", {
+   openInBrowser: (pathAndQuery) => ipcRenderer.send("open-in-browser", String(pathAndQuery || "/")),
++  restart: () => ipcRenderer.send("restart"),
+ });
+diff --git a/desktop/setup.html b/desktop/setup.html
+index db20516..f587037 100644
+--- a/desktop/setup.html
++++ b/desktop/setup.html
+@@ -58,9 +58,30 @@
+   <div class="note" id="note">One-time setup. Next time Stagelight opens in seconds.</div>
+ <script>
+   const $ = (id) => document.getElementById(id);
++  // The app passes the interface language in the address (?lang=es).
++  const ES = {
++    "Starting up…": "Arrancando…",
++    "Python runtime": "Entorno de Python",
++    "a private copy, nothing installed system-wide": "una copia propia, no se instala nada en el sistema",
++    "AI engine": "Motor de IA",
++    "vocal separation, lyrics transcription": "separación de voz, transcripción de letras",
++    "Start": "Inicio",
++    "opening Stagelight": "abriendo Stagelight",
++    "Try again": "Reintentar",
++    "Open log": "Abrir el registro",
++    "One-time setup. Next time Stagelight opens in seconds.": "Configuración inicial, solo una vez. La próxima vez Stagelight se abre en segundos.",
++    "Setting up the AI engine (first launch only)": "Instalando el motor de IA (solo la primera vez)",
++    "Starting Stagelight…": "Iniciando Stagelight…",
++  };
++  const es = new URLSearchParams(location.search).get("lang") === "es";
++  const tr = (s) => (es && ES[s]) || s;
++  if (es) {
++    document.documentElement.lang = "es";
++    document.querySelectorAll("h1, b, small, button, .note").forEach((el) => { el.textContent = tr(el.textContent); });
++  }
+   const lines = [];
+   const MAX = 14;
+-  stagelight.on("first-run", () => { $("headline").textContent = "Setting up the AI engine (first launch only)"; });
++  stagelight.on("first-run", () => { $("headline").textContent = tr("Setting up the AI engine (first launch only)"); });
+   stagelight.on("log", (line) => {
+     lines.push(line);
+     if (lines.length > MAX) lines.shift();
+@@ -71,7 +92,7 @@
+     li.className = state;
+     if (detail && id === "packages") $("pkgDetail").textContent = detail;
+     if (detail && id === "start") $("startDetail").textContent = detail;
+-    if (id === "start" && state === "active") $("headline").textContent = "Starting Stagelight…";
++    if (id === "start" && state === "active") $("headline").textContent = tr("Starting Stagelight…");
+   });
+   stagelight.on("failed", ({ message }) => {
+     $("fail").style.display = "block";
+diff --git a/pipeline.py b/pipeline.py
+index e1cd0fe..8c59ea2 100644
+--- a/pipeline.py
++++ b/pipeline.py
+@@ -22,7 +22,53 @@ import soundfile as sf
+ 
+ # The desktop app installs the code read-only and points these at the user's app-data folder.
+ _HERE = Path(__file__).parent
+-DATA = Path(os.environ.get("STAGELIGHT_DATA") or _HERE / "data")
++# Settings needed before the server starts, such as where the songs live (chosen in Settings).
++# The desktop app keeps this file with its other app data; the web version next to this file.
++CONFIG = Path(os.environ.get("STAGELIGHT_CONFIG") or _HERE / "config.json")
++DEFAULT_DATA = Path(os.environ.get("STAGELIGHT_DATA") or _HERE / "data")
++
++
++def read_config() -> dict:
++    try:
++        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
++        return cfg if isinstance(cfg, dict) else {}
++    except (OSError, ValueError):
++        return {}
++
++
++def _data_dir() -> Path:
++    custom = read_config().get("dataDir")
++    if custom:
++        try:
++            Path(custom).mkdir(parents=True, exist_ok=True)
++            return Path(custom)
++        except OSError:  # e.g. an external drive that isn't plugged in right now
++            print(f"Can't use the song folder {custom}; using {DEFAULT_DATA} for now", flush=True)
++    return DEFAULT_DATA
++
++
++DATA = _data_dir()
++
++
++def apply_pending_move() -> None:
++    """After the song folder was changed with "move my songs": move them over, before anything
++    else opens them. Songs already present in the new folder are left where they were."""
++    cfg = read_config()
++    src = cfg.pop("moveFrom", None)
++    if src is None:
++        return
++    src = Path(src)
++    if src.is_dir() and src.resolve() != DATA.resolve():
++        for item in list(src.iterdir()):
++            target = DATA / item.name
++            if target.exists():
++                continue
++            try:
++                shutil.move(str(item), str(target))
++            except OSError as e:
++                print(f"Couldn't move {item} to {target}: {e}", flush=True)
++        print(f"Moved songs from {src} to {DATA}", flush=True)
++    write_json(CONFIG, cfg)
+ 
+ # audio-separator / pydub look for a plain "ffmpeg" on PATH. Use the system one if there is one,
+ # otherwise expose the binary bundled with imageio-ffmpeg under that name.
+@@ -221,6 +267,23 @@ _separator = None
+ _loaded_model = None
+ 
+ 
++def _on_gpu(sep) -> bool:
++    return str(sep.torch_device) != "cpu"
++
++
++def _fall_back_to_cpu(sep, model_file: str, error: Exception) -> None:
++    """The GPU failed (out of memory, old driver, unsupported card): finish on the CPU instead.
++    The switch lasts until the app restarts, so later songs don't fail on the GPU first."""
++    import torch
++
++    print(f"GPU separation failed ({type(error).__name__}: {error}); falling back to the CPU", flush=True)
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++    sep.torch_device = sep.torch_device_cpu
++    sep.onnx_execution_provider = ["CPUExecutionProvider"]
++    sep.load_model(model_filename=model_file, force_reload=True)
++
++
+ def separate(mix: Path, stems: Path, model_key: str, report: Report) -> None:
+     report("separate", None)  # before the imports: they alone take a few seconds
+     import logging
+@@ -234,8 +297,14 @@ def separate(mix: Path, stems: Path, model_key: str, report: Report) -> None:
+     if _separator is None:
+         _separator = Separator(log_level=logging.WARNING, model_file_dir=str(MODEL_DIR),
+                                output_format="WAV", mdx_params=MDX_PARAMS, mdxc_params=MDXC_PARAMS)
++    model_file = SEPARATION_MODELS[model_key]["file"]
+     if _loaded_model != model_key:
+-        _separator.load_model(model_filename=SEPARATION_MODELS[model_key]["file"])  # downloads on first use
++        try:
++            _separator.load_model(model_filename=model_file)  # downloads on first use
++        except Exception as e:
++            if not _on_gpu(_separator):
++                raise
++            _fall_back_to_cpu(_separator, model_file, e)
+         _loaded_model = model_key
+ 
+     # The models loop over chunks with tqdm; swap it for one that feeds our progress bar.
+@@ -259,7 +328,17 @@ def separate(mix: Path, stems: Path, model_key: str, report: Report) -> None:
+     try:
+         _separator.output_dir = _separator.model_instance.output_dir = str(work)
+         names = {"Vocals": "vocals", "Instrumental": "instrumental", "Other": "instrumental"}
+-        files = [work / Path(f).name for f in _separator.separate(str(mix), names)]
++        try:
++            outputs = _separator.separate(str(mix), names)
++        except Exception as e:
++            if not _on_gpu(_separator):
++                raise
++            _fall_back_to_cpu(_separator, model_file, e)
++            _separator.output_dir = _separator.model_instance.output_dir = str(work)
++            state["done"] = 0.0
++            report("separate", None)
++            outputs = _separator.separate(str(mix), names)
++        files = [work / Path(f).name for f in outputs]
+         vocal = next((f for f in files if "vocal" in f.stem.lower()), None)
+         inst = next((f for f in files if f != vocal), None)
+         if not vocal or not inst:
+@@ -327,9 +406,21 @@ def _similar(a: str, b: str) -> float:
+     return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
+ 
+ 
++LRCLIB_API = "https://lrclib.net/api"
++LRCLIB_HEADERS = {"User-Agent": "Stagelight karaoke (https://github.com/bartoszkolo/stagelight)"}
++
++
++def _lrclib_score(x: dict, artist: str, title: str, duration: float) -> float:
++    s = 2 * _similar(x.get("trackName"), title) + _similar(x.get("artistName"), artist)
++    d = (x.get("duration") or 0) - duration
++    # Music videos are often longer than the album track (intros, outros), rarely shorter.
++    s -= 0.02 * max(0, abs(d) - 3) * (0.5 if d < 0 else 1.5)
++    return s
++
++
+ def fetch_lrclib(artist: str, title: str, duration: float) -> dict | None:
+-    headers = {"User-Agent": "Stagelight karaoke (https://github.com/bartoszkolo/stagelight)"}
+-    api = "https://lrclib.net/api"
++    headers = LRCLIB_HEADERS
++    api = LRCLIB_API
+     with httpx.Client(timeout=15, headers=headers) as c:
+         # Exact lookup first (matches duration within ~2 s), then progressively looser searches.
+         r = c.get(f"{api}/get", params={"artist_name": artist, "track_name": title, "duration": round(duration)})
+@@ -344,15 +435,40 @@ def fetch_lrclib(artist: str, title: str, duration: float) -> dict | None:
+             if results:
+                 break
+ 
+-    def score(x):
+-        s = 2 * _similar(x.get("trackName"), title) + _similar(x.get("artistName"), artist)
+-        d = (x.get("duration") or 0) - duration
+-        # Music videos are often longer than the album track (intros, outros), rarely shorter.
+-        s -= 0.02 * max(0, abs(d) - 3) * (0.5 if d < 0 else 1.5)
+-        return s
+-
+     results = [x for x in results if _similar(x.get("trackName"), title) > 0.5]
+-    return max(results, key=score) if results else None
++    return max(results, key=lambda x: _lrclib_score(x, artist, title, duration)) if results else None
++
++
++def lrclib_candidates(artist: str, title: str, duration: float, query: str | None = None,
++                      limit: int = 15) -> list[dict]:
++    """Every timed LRCLIB version of a song, best match first, for picking another one by hand.
++    With `query`, a free-text search instead (for when the artist or title was guessed wrong)."""
++    searches = ([{"q": query}] if query else
++                [{"artist_name": artist, "track_name": title}, {"track_name": title}, {"q": f"{artist} {title}"}])
++    found: dict[int, dict] = {}
++    with httpx.Client(timeout=15, headers=LRCLIB_HEADERS) as c:
++        for params in searches:
++            r = c.get(f"{LRCLIB_API}/search", params=params)
++            if r.status_code == 200:
++                for x in r.json():
++                    if x.get("syncedLyrics") and not x.get("instrumental"):
++                        found.setdefault(x["id"], x)
++    ranked = list(found.values())
++    if not query:  # a free-text search keeps LRCLIB's own order
++        ranked.sort(key=lambda x: _lrclib_score(x, artist, title, duration), reverse=True)
++    out = []
++    for x in ranked[:limit]:
++        first = [ln["text"] for ln in parse_lrc(x["syncedLyrics"])[:2]]
++        out.append({"id": x["id"], "artist": x.get("artistName"), "title": x.get("trackName"),
++                    "album": x.get("albumName"), "duration": x.get("duration"), "preview": " / ".join(first)})
++    return out
++
++
++def lrclib_get(lyrics_id: int) -> dict:
++    with httpx.Client(timeout=15, headers=LRCLIB_HEADERS) as c:
++        r = c.get(f"{LRCLIB_API}/get/{int(lyrics_id)}")
++        r.raise_for_status()
++        return r.json()
+ 
+ 
+ _TS = re.compile(r"\[(\d+):(\d+)(?:[.:](\d+))?\]")
+@@ -593,13 +709,44 @@ def process(url: str, model_key: str, report: Report) -> dict:
+         offset = best_offset(lines, vocal_envelope(vocals))
+         source = "lrclib"
+         artist, title = found.get("artistName") or artist, found.get("trackName") or title
++        lrclib_id = found.get("id")
+     else:
+         lines = transcribe(vocals, report)
+         source = "whisper"
++        lrclib_id = None
+ 
+     result = {
+         "id": vid, "artist": artist, "title": title, "videoTitle": meta["title"],
+-        "source": source, "offset": offset, "lines": lines,
++        "source": source, "offset": offset, "lines": lines, "lrclibId": lrclib_id, "autoSync": True,
+     }
+     write_json(result_path, result)
+     return load_result(vid)
++
++
++def choose_lyrics(vid: str, source: str, lyrics_id: int | None = None, auto_sync: bool = True) -> dict:
++    """Different lyrics for a processed song: another LRCLIB version (auto-synced to the vocals, or
++    with LRCLIB's own timings as they are) or a Whisper transcription. Returns the result.json fields
++    to change; the caller writes them."""
++    out = DATA / vid
++    vocals = next(iter(sorted((out / "stems").glob("*/vocals.wav"))), None)
++    if source == "lrclib":
++        if lyrics_id is None:
++            raise ValueError("Pick which lyrics to use")
++        found = lrclib_get(lyrics_id)
++        if not found.get("syncedLyrics"):
++            raise ValueError("Those lyrics have no timings")
++        lines = parse_lrc(found["syncedLyrics"])
++        synced = bool(auto_sync and vocals)
++        update = {"source": "lrclib", "lrclibId": found.get("id"), "autoSync": synced, "lines": lines,
++                  "offset": best_offset(lines, vocal_envelope(vocals)) if synced else 0.0}
++        if found.get("artistName"):
++            update["artist"] = found["artistName"]
++        if found.get("trackName"):
++            update["title"] = found["trackName"]
++        return update
++    if source == "whisper":
++        if not vocals:
++            raise ValueError("This song has no separated vocals to listen to")
++        return {"source": "whisper", "lrclibId": None, "lines": transcribe(vocals, lambda *a, **k: None),
++                "offset": 0.0}
++    raise ValueError(f"Unknown lyrics source: {source}")
+diff --git a/server.py b/server.py
+index 6a49564..980abf2 100644
+--- a/server.py
++++ b/server.py
+@@ -1,10 +1,12 @@
+ import itertools
+ import json
++import os
+ import queue
+ import threading
+ import time
+ import traceback
+ 
++import httpx
+ from fastapi import FastAPI, HTTPException
+ from fastapi.staticfiles import StaticFiles
+ from pydantic import BaseModel
+@@ -43,13 +45,52 @@ def worker():
+             if job.get("cancel"):  # yt-dlp may wrap our exception in its own: the flag is what counts
+                 pipeline.clean_up_cancelled(key.split(":")[0])
+                 job["stage"], job["error"] = "cancelled", "Cancelled"
+-                continue
+-            traceback.print_exc()
+-            job["stage"], job["error"] = "error", str(e) or e.__class__.__name__
++            else:
++                traceback.print_exc()
++                job["stage"], job["error"] = "error", str(e) or e.__class__.__name__
++        finally:
++            with lock:
++                save_queue()
++
++
++# The queue survives a restart (closing the app, a crash): what's waiting or running is written to
++# queue.json and picked up again on the next start. A song that was mid-way keeps what it already
++# finished: the download, and the lyrics; only a half-done separation starts over.
++QUEUE_FILE = pipeline.DATA / "queue.json"
+ 
+ 
+-pipeline.DATA.mkdir(exist_ok=True)
++def save_queue():
++    """Call with `lock` held."""
++    pending = sorted((j for j in jobs.values()
++                      if j["stage"] not in ("done", "error", "cancelled") and not j.get("cancel") and j.get("url")),
++                     key=lambda j: j["seq"])
++    try:
++        pipeline.write_json(QUEUE_FILE, [{"url": j["url"], "model": j["model"], "title": j.get("title")}
++                                         for j in pending])
++    except OSError:
++        traceback.print_exc()
++
++
++def restore_queue():
++    try:
++        saved = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return
++    for item in saved if isinstance(saved, list) else []:
++        url, model = item.get("url") or "", item.get("model")
++        vid = pipeline.video_id(url)
++        if not vid or model not in pipeline.SEPARATION_MODELS or f"{vid}:{model}" in jobs:
++            continue
++        key = f"{vid}:{model}"
++        jobs[key] = {"stage": "queued", "progress": None, "stageStarted": time.time(), "seq": next(order),
++                     "id": vid, "model": model, "title": item.get("title"), "url": url}
++        work.put((key, url, model))
++
++
++pipeline.DATA.mkdir(parents=True, exist_ok=True)
++pipeline.apply_pending_move()
+ pipeline.migrate_legacy()
++restore_queue()
+ threading.Thread(target=worker, daemon=True).start()
+ 
+ 
+@@ -106,8 +147,9 @@ def create_job(body: JobIn):
+                          "title": result["title"], "finished": time.time()}
+         else:
+             jobs[key] = {"stage": "queued", "progress": None, "stageStarted": time.time(), "seq": next(order),
+-                         "id": vid, "model": body.model, "title": body.title}
++                         "id": vid, "model": body.model, "title": body.title, "url": body.url}
+             work.put((key, body.url, body.model))
++            save_queue()
+     return {"id": vid, "model": body.model}
+ 
+ 
+@@ -137,10 +179,12 @@ def dismiss_job(vid: str, model: str):
+             raise HTTPException(404)
+         if job["stage"] == "queued":
+             job["stage"], job["error"] = "cancelled", "Removed from the queue"
++            save_queue()
+         elif job["stage"] in ("done", "error", "cancelled"):
+             jobs.pop(f"{vid}:{model}")
+         else:
+             job["cancel"] = True  # the worker stops at its next progress report
++            save_queue()
+             return {"ok": True, "cancelling": True}
+     return {"ok": True}
+ 
+@@ -229,17 +273,118 @@ def save_offset(vid: str, body: OffsetIn):
+     return {"ok": True}
+ 
+ 
++def _song_paths(vid: str):
++    out = pipeline.DATA / vid
++    if not pipeline.video_id(vid) or not (out / "result.json").exists() or not (out / "meta.json").exists():
++        raise HTTPException(404, "This song hasn't been processed yet")
++    return out / "result.json", out / "meta.json"
++
++
++@app.get("/api/songs/{vid}/lyrics")
++def lyric_options(vid: str, q: str | None = None):
++    """The LRCLIB versions to choose from (or a free-text search with `q`)."""
++    result_path, meta_path = _song_paths(vid)
++    result = json.loads(result_path.read_text(encoding="utf-8"))
++    meta = json.loads(meta_path.read_text(encoding="utf-8"))
++    artist, title = pipeline.guess_artist_title(meta)
++    try:
++        candidates = pipeline.lrclib_candidates(artist, title, meta["duration"], (q or "").strip() or None)
++    except httpx.HTTPError:
++        raise HTTPException(502, "Couldn't reach LRCLIB")
++    return {"query": f"{artist} {title}", "duration": meta["duration"], "current": result.get("lrclibId"),
++            "source": result.get("source"), "autoSync": result.get("autoSync", True), "candidates": candidates}
++
++
++class LyricsIn(BaseModel):
++    source: str               # "lrclib" or "whisper"
++    id: int | None = None     # LRCLIB lyrics id
++    autoSync: bool = True     # shift the LRCLIB timings to match the vocals, or keep them as they are
++
++
++@app.post("/api/songs/{vid}/lyrics")
++def set_lyrics(vid: str, body: LyricsIn):
++    """Swap the lyrics of a processed song. Whisper takes a few minutes; LRCLIB a second or two."""
++    result_path, _ = _song_paths(vid)
++    try:
++        update = pipeline.choose_lyrics(vid, body.source, body.id, body.autoSync)
++    except ValueError as e:
++        raise HTTPException(400, str(e))
++    except httpx.HTTPStatusError as e:
++        if e.response.status_code == 404:
++            raise HTTPException(400, "Those lyrics aren't on LRCLIB anymore")
++        raise HTTPException(502, "LRCLIB had a problem, try again in a moment")
++    except httpx.HTTPError:
++        raise HTTPException(502, "Couldn't reach LRCLIB")
++    with lock:
++        data = json.loads(result_path.read_text(encoding="utf-8"))
++        data.update(update)
++        pipeline.write_json(result_path, data)
++        for key, job in list(jobs.items()):
++            if key.startswith(vid + ":") and "result" in job:
++                job["result"] = {**job["result"], **update}
++    return pipeline.load_result(vid)
++
++
++@app.get("/api/storage")
++def storage():
++    chosen = pipeline.read_config().get("dataDir")
++    return {"path": str(pipeline.DATA), "default": str(pipeline.DEFAULT_DATA),
++            "next": chosen or str(pipeline.DEFAULT_DATA)}
++
++
++class StorageIn(BaseModel):
++    path: str = ""     # empty: back to the default folder
++    move: bool = True  # move the songs that are already there
++
++
++@app.post("/api/storage")
++def set_storage(body: StorageIn):
++    """Choose where songs are kept. Takes effect (and moves the songs) on the next start."""
++    raw = body.path.strip().strip('"')
++    target = pipeline.Path(os.path.expandvars(os.path.expanduser(raw))) if raw else pipeline.DEFAULT_DATA
++    if not target.is_absolute():
++        raise HTTPException(400, "Use a full folder path, like D:\\Karaoke")
++    current, new = pipeline.DATA.resolve(), target.resolve()
++    if body.move and new != current and (current in new.parents or new in current.parents):
++        raise HTTPException(400, "Pick a folder that isn't inside the current one (or the other way round)")
++    try:
++        target.mkdir(parents=True, exist_ok=True)
++        probe = target / ".stagelight-write-test"
++        probe.write_text("ok")
++        probe.unlink()
++    except OSError as e:
++        raise HTTPException(400, f"Can't use that folder: {e.strerror or e}")
++    cfg = pipeline.read_config()
++    cfg.pop("dataDir", None)
++    if raw:
++        cfg["dataDir"] = str(target)
++    cfg.pop("moveFrom", None)
++    if body.move and new != current:
++        cfg["moveFrom"] = str(pipeline.DATA)
++    pipeline.write_json(pipeline.CONFIG, cfg)
++    return {"path": str(target), "restart": new != current}
++
++
++class LangIn(BaseModel):
++    lang: str
++
++
++@app.post("/api/lang")
++def set_lang(body: LangIn):
++    """Remember the interface language for the desktop app's own screens and menus."""
++    with lock:
++        cfg = pipeline.read_config()
++        cfg["lang"] = body.lang if body.lang in ("en", "es") else "auto"
++        pipeline.write_json(pipeline.CONFIG, cfg)
++    return {"ok": True}
++
++
+ STATIC = pipeline.Path(__file__).parent / "static"
+ 
+ 
+ @app.get("/api/library")
+ def library():
+-    # Built-in songs first (freely licensed, shipped in static/songs/), then the user's own.
+     items = []
+-    for p in sorted(STATIC.glob("songs/*/song.json")):
+-        d = json.loads(p.read_text(encoding="utf-8"))
+-        items.append({"id": d["id"], "artist": d["artist"], "title": d["title"], "stems": d["stems"],
+-                      "source": "bundled", "bundled": True})
+     for p in sorted(pipeline.DATA.glob("*/result.json"), key=lambda p: -p.stat().st_mtime):
+         try:
+             d = pipeline.load_result(p.parent.name)
+diff --git a/static/app.js b/static/app.js
+index f42d3f3..154530e 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -10,7 +10,7 @@ const thumb = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+ const DEFAULTS = {
+   size: 100, font: "modern", anim: "wipe", color: "#ffd447", lines: "3", position: "bottom",
+   ball: true, countdown: true, dim: 15, blur: false, music: 100, vocal: 0, model: "karaoke", video: true,
+-  difficulty: "normal", micDelay: 120,
++  difficulty: "normal", micDelay: 120, lang: "auto",
+ };
+ const FONTS = {
+   modern: "Outfit, system-ui, sans-serif",
+@@ -30,6 +30,13 @@ function saveSettings() {
+ let saveSettingsTimer;
+ function set(key, value) {
+   settings[key] = value;
++  // The page's text is translated once, at load: a new language means a reload.
++  if (key === "lang") {
++    saveSettings();
++    if (!STATIC) fetch("/api/lang", { method: "POST", keepalive: true, headers: { "Content-Type": "application/json" },
++                                      body: JSON.stringify({ lang: value }) }).catch(() => {});
++    return location.reload();
++  }
+   clearTimeout(saveSettingsTimer);
+   saveSettingsTimer = setTimeout(saveSettings, 300);
+   // Volumes change on every slider tick: keep that path cheap and don't touch the lyric DOM.
+@@ -111,7 +118,7 @@ $("seek").addEventListener("input", (e) => {
+ });
+ $("seek").addEventListener("change", () => { commitSeek(); scrubbing = false; $("seek").blur(); });
+ function commitSeek() { if (isFinite(audio.duration)) audio.currentTime = seekTarget(); }
+-$("resetSettings").onclick = () => { settings = { ...DEFAULTS, model: settings.model }; saveSettings(); applySettings(); };
++$("resetSettings").onclick = () => { settings = { ...DEFAULTS, model: settings.model, lang: settings.lang }; saveSettings(); applySettings(); };
+ $("modelSelect").addEventListener("change", (e) => set("model", e.target.value));
+ 
+ const player = $("player");
+@@ -125,7 +132,7 @@ function hostSettings() {
+ }
+ const openSettings = (open = !settingsOpen()) => {
+   const drawer = $("settings");
+-  if (open) { hostSettings(); renderPreview(); }
++  if (open) { hostSettings(); renderPreview(); refreshLyricSource(); loadStorage(); }
+   drawer.classList.toggle("open", open);
+   player.classList.toggle("settings-open", open);
+   drawer.inert = !open; // keep Tab out of the panel while it's closed
+@@ -141,7 +148,7 @@ $("closeSettings").onclick = () => openSettings(false);
+ 
+ // Live preview at the top of the settings: a sample line in the chosen font, size, colour and
+ // highlight style, frozen mid-line (two words sung, one being sung), with the ball above it.
+-const PREVIEW_WORDS = ["Sing", "along", "with", "the", "stage", "lights"];
++const PREVIEW_WORDS = t("Sing along with the stage lights").split(" ");
+ function renderPreview() {
+   const stage = $("previewStage"), cur = $("previewCur");
+   stage.className = `preview-stage anim-${settings.anim} font-${settings.font} lines-${settings.lines}`;
+@@ -176,11 +183,11 @@ async function loadModels() {
+     : await (await fetch("/api/models")).json();
+   models = data.models;
+   if (!models.some((m) => m.key === settings.model)) settings.model = data.default;
+-  $("modelSelect").replaceChildren(...models.map((m) => new Option(`${m.name} · ${m.speed.toLowerCase()}`, m.key)));
++  $("modelSelect").replaceChildren(...models.map((m) => new Option(`${t(m.name)} · ${t(m.speed).toLowerCase()}`, m.key)));
+   $("modelSelect").value = settings.model;
+   renderModels();
+ }
+-const modelName = (key) => models.find((m) => m.key === key)?.name || key;
++const modelName = (key) => t(models.find((m) => m.key === key)?.name || key);
+ 
+ function renderModels() {
+   const list = $("modelList");
+@@ -192,18 +199,19 @@ function renderModels() {
+     el.tabIndex = 0;
+     el.innerHTML = `<span class="radio"></span><span class="name"></span><span class="speed ${m.speed.toLowerCase()}"></span>
+       <span class="desc"></span><span class="act"></span>`;
+-    el.querySelector(".name").textContent = m.name;
+-    el.querySelector(".speed").textContent = m.speed;
+-    el.querySelector(".desc").textContent = m.desc;
++    el.querySelector(".name").textContent = t(m.name);
++    el.querySelector(".speed").textContent = t(m.speed);
++    el.querySelector(".desc").textContent = t(m.desc);
+     const act = el.querySelector(".act");
+     if (song) {
+       if (m.key === currentModel) {
+-        act.innerHTML = `<span class="playing">● Playing on this song</span>`;
++        act.innerHTML = `<span class="playing"></span>`;
++        act.firstChild.textContent = t("● Playing on this song");
+       } else if (song.stems.includes(m.key)) {
+-        const b = button("Switch to this", "btn ghost", () => switchStems(m.key));
+-        act.append(b, "ready, instant");
++        const b = button(t("Switch to this"), "btn ghost", () => switchStems(m.key));
++        act.append(b, t("ready, instant"));
+       } else {
+-        act.append(button("Process this song", "btn ghost", () => start(song.id, m.key)));
++        act.append(button(t("Process this song"), "btn ghost", () => start(song.id, m.key)));
+       }
+     }
+     el.onclick = () => set("model", m.key);
+@@ -218,6 +226,155 @@ function button(label, cls, onclick) {
+   return b;
+ }
+ 
++// ============================================================ lyrics source
++
++// Which lyrics a processed song uses: another LRCLIB version, LRCLIB's timings as they are
++// (auto-sync off), or a Whisper transcription. Lives in the settings drawer.
++let srcData = null, srcFor = null, srcBusy = false;
++const canPickLyrics = () => !STATIC && !!song && !song.bundled;
++const srcStatus = (text) => { $("srcStatus").textContent = text || ""; };
++
++function renderSrcNow() {
++  if (!song) return;
++  $("srcNow").textContent = t(!song.lines?.length ? "No lyrics yet."
++    : song.source === "whisper" ? "Now using: a Whisper transcription of the vocals."
++    : song.autoSync === false ? "Now using: LRCLIB lyrics with their original timing."
++    : "Now using: LRCLIB lyrics, auto-synced to the vocals.");
++  $("srcAutoSync").checked = song.autoSync !== false;
++}
++
++async function refreshLyricSource(query = null) {
++  const box = $("lyricSource");
++  box.hidden = !canPickLyrics();
++  if (box.hidden) return;
++  renderSrcNow();
++  if (!query && srcFor === song.id && srcData) return renderSrcList();
++  const id = song.id;
++  srcStatus(t("Looking for lyrics…"));
++  $("srcList").replaceChildren();
++  try {
++    const r = await fetch(`/api/songs/${id}/lyrics${query ? `?q=${encodeURIComponent(query)}` : ""}`);
++    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || r.statusText));
++    const data = await r.json();
++    if (song?.id !== id) return;
++    srcData = data;
++    srcFor = id;
++    if (!query) $("srcQuery").value = data.query;
++    srcStatus(data.candidates.length ? "" : t("No timed lyrics found on LRCLIB. Try another search, or Whisper."));
++    renderSrcList();
++  } catch (e) {
++    if (song?.id === id) srcStatus(t("Couldn't load the lyrics list: {error}", { error: e.message }));
++  }
++}
++
++function renderSrcList() {
++  const cur = song.source === "lrclib" ? song.lrclibId : null;
++  $("srcList").replaceChildren(...srcData.candidates.map((c) => {
++    const el = document.createElement("div");
++    el.className = `model${c.id === cur ? " on" : ""}`;
++    el.setAttribute("role", "button");
++    el.tabIndex = 0;
++    el.innerHTML = `<span class="radio"></span><span class="name"></span><span class="speed"></span><span class="desc"></span>`;
++    el.querySelector(".name").textContent = `${c.artist} – ${c.title}`;
++    // Length next to the video's: a version of the same length usually lines up best.
++    const sp = el.querySelector(".speed");
++    const d = c.duration ? Math.round(c.duration - srcData.duration) : null;
++    sp.textContent = c.duration ? fmt(c.duration) + (d != null && Math.abs(d) > 2 ? ` (${d > 0 ? "+" : "−"}${Math.abs(d)}s)` : "") : "?";
++    sp.title = d == null ? "" : t(Math.abs(d) <= 2 ? "Same length as the video" : "Length difference from the video");
++    if (d != null && Math.abs(d) <= 2) sp.classList.add("fast");
++    const desc = el.querySelector(".desc");
++    desc.textContent = [c.album, c.preview].filter(Boolean).join(" · ");
++    desc.title = c.preview || "";
++    const pick = () => chooseLyrics({ source: "lrclib", id: c.id, autoSync: $("srcAutoSync").checked });
++    el.onclick = pick;
++    el.onkeydown = (e) => { if (e.key === "Enter") pick(); };
++    return el;
++  }));
++}
++
++async function chooseLyrics(body) {
++  if (srcBusy || !song) return;
++  const id = song.id;
++  srcBusy = true;
++  $("srcList").classList.add("busy");
++  $("srcWhisper").disabled = $("srcAutoSync").disabled = true;
++  srcStatus(t(body.source === "whisper" ? "Listening with Whisper… this can take a few minutes." : "Loading lyrics…"));
++  try {
++    const r = await fetch(`/api/songs/${id}/lyrics`, {
++      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
++    });
++    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || r.statusText));
++    const result = await r.json();
++    if (song?.id !== id) return;
++    // Swap the lyrics in place: the music keeps playing where it was.
++    song = result;
++    offset = result.offset || 0;
++    lines = result.lines.map(withWords);
++    shownIdx = -2;
++    updateSub();
++    updateOffset(0);
++    if (!lines.length) $("lCur").textContent = t("No lyrics found. Enjoy the instrumental 🎶");
++    srcStatus("");
++    toast(t(body.source === "whisper" ? "Lyrics transcribed by Whisper." : "Lyrics changed."));
++  } catch (e) {
++    srcStatus(t("Couldn't change the lyrics: {error}", { error: e.message }));
++  } finally {
++    srcBusy = false;
++    $("srcList").classList.remove("busy");
++    $("srcWhisper").disabled = $("srcAutoSync").disabled = false;
++    if (song?.id === id) { renderSrcNow(); if (srcData && srcFor === id) renderSrcList(); }
++  }
++}
++
++$("srcSearch").addEventListener("submit", (e) => {
++  e.preventDefault();
++  const q = $("srcQuery").value.trim();
++  if (q) refreshLyricSource(q);
++});
++$("srcWhisper").onclick = () => chooseLyrics({ source: "whisper" });
++// Flipping auto-sync re-applies the lyrics in use, so its effect shows right away.
++$("srcAutoSync").addEventListener("change", (e) => {
++  if (song?.source === "lrclib" && song.lrclibId) chooseLyrics({ source: "lrclib", id: song.lrclibId, autoSync: e.target.checked });
++});
++
++// ============================================================ song storage
++
++// Where the server keeps songs. Changing it is saved on the server and applied on the next start,
++// when the songs are moved over too (the desktop app restarts itself).
++let storageLoaded = false;
++async function loadStorage() {
++  if (STATIC || storageLoaded) return;
++  try {
++    const d = await (await fetch("/api/storage")).json();
++    $("storagePath").value = d.next;
++    $("storagePath").placeholder = d.default;
++    $("storageStatus").textContent = d.next !== d.path ? t("Waiting for a restart. Songs are still in {path}.", { path: d.path }) : "";
++    storageLoaded = true;
++  } catch {}
++}
++$("storageForm").addEventListener("submit", async (e) => {
++  e.preventDefault();
++  const status = $("storageStatus");
++  status.textContent = t("Checking the folder…");
++  try {
++    const r = await fetch("/api/storage", {
++      method: "POST", headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ path: $("storagePath").value, move: $("storageMove").checked }),
++    });
++    const d = await r.json().catch(() => ({}));
++    if (!r.ok) throw new Error(t(d.detail || r.statusText));
++    $("storagePath").value = d.path;
++    if (!d.restart) { status.textContent = t("That's already the song folder."); return; }
++    if (window.stagelightDesktop?.restart) {
++      status.textContent = t("Saved. Restarting Stagelight…");
++      setTimeout(() => window.stagelightDesktop.restart(), 800);
++    } else status.textContent = t("Saved. Restart Stagelight to start using the new folder.");
++  } catch (err) {
++    status.textContent = err.message;
++  }
++});
++if (STATIC) $("storageSection").hidden = true;
++
+ // ============================================================ views & jobs
+ 
+ function show(view) {
+@@ -238,7 +395,7 @@ $("form").addEventListener("submit", (e) => {
+   else searchSongs(q);
+ });
+ $("url").addEventListener("input", () => {
+-  $("go").textContent = looksLikeLink($("url").value) ? "Make it karaoke" : "Search";
++  $("go").textContent = t(looksLikeLink($("url").value) ? "Make it karaoke" : "Search");
+ });
+ 
+ let pollToken = 0;
+@@ -254,7 +411,7 @@ async function start(url, model, { push = true, title = null } = {}) {
+     const r = await fetch("/api/jobs", {
+       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url, model, title }),
+     });
+-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "Something went wrong");
++    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || "Something went wrong"));
+     const { id } = await r.json();
+     const target = `?v=${id}&m=${model}`;
+     if (push && location.search !== target) history.pushState(null, "", target);
+@@ -272,7 +429,7 @@ $("url").addEventListener("input", () => { $("formError").hidden = true; });
+ 
+ function showProcError(message) {
+   $("procError").replaceChildren(message, document.createElement("br"),
+-    button("Try again", "btn ghost small", () => start(lastRequest.url, lastRequest.model, { push: false })));
++    button(t("Try again"), "btn ghost small", () => start(lastRequest.url, lastRequest.model, { push: false })));
+   $("procError").hidden = false;
+   $("barFill").classList.remove("indeterminate");
+   const active = document.querySelector("#steps li.active");
+@@ -298,14 +455,14 @@ async function poll(id, model, token) {
+       job = await r.json();
+       failures = 0;
+     } catch {
+-      if (++failures > 10) throw new Error("Lost connection to the Stagelight server. Is it still running?");
++      if (++failures > 10) throw new Error(t("Lost connection to the Stagelight server. Is it still running?"));
+       await new Promise((r) => setTimeout(r, 1500));
+       continue;
+     }
+     if (token !== pollToken) return;
+     if (job.stage === "done") { document.title = "Stagelight Karaoke"; return load(job.result, model); }
+-    if (job.stage === "cancelled") { goHome(); return toast("Processing cancelled."); }
+-    if (job.stage === "error") throw new Error(job.error);
++    if (job.stage === "cancelled") { goHome(); return toast(t("Processing cancelled.")); }
++    if (job.stage === "error") throw new Error(t(job.error));
+     procJob = { id, model };
+     if (first) {
+       first = false;
+@@ -313,7 +470,7 @@ async function poll(id, model, token) {
+       setArt(id);
+       $("procThumb").src = thumb(id);
+       $("procError").hidden = true;
+-      $("procTitle").textContent = "Fetching video…";
++      $("procTitle").textContent = t("Fetching video…");
+     }
+     renderProgress(job, model);
+     await new Promise((r) => setTimeout(r, 1000));
+@@ -334,27 +491,29 @@ function renderProgress(job, model) {
+   const p = job.progress;
+   // Visible in the browser tab while you do something else during the wait.
+   document.title = `${p != null && step === "separate" ? Math.round(p * 100) + "% · " : ""}${
+-    step ? $(`steps`).querySelector(`[data-step="${step}"] span`).textContent : "Waiting"} · Stagelight`;
++    step ? $(`steps`).querySelector(`[data-step="${step}"] span`).textContent : t("Waiting")} · Stagelight`;
+   const fill = $("barFill");
+   fill.classList.toggle("indeterminate", p == null);
+   fill.style.width = `${(p || 0) * 100}%`;
+ 
+   let note = "";
+   $("procStop").disabled = !!job.cancel;
+-  if (job.cancel) note = "Cancelling…";
+-  else if (job.stage === "queued") note = job.queuePos ? `Waiting for ${job.queuePos} other song${job.queuePos > 1 ? "s" : ""}…` : "Starting…";
+-  else if (step === "separate") {
+-    note = `${modelName(model)} model`;
+-    if (job.stage === "encode") note = "Saving the instrumental…";
++  if (job.cancel) note = t("Cancelling…");
++  else if (job.stage === "queued") {
++    note = !job.queuePos ? t("Starting…") : job.queuePos === 1 ? t("Waiting for 1 other song…")
++      : t("Waiting for {n} other songs…", { n: job.queuePos });
++  } else if (step === "separate") {
++    note = t("{name} model", { name: modelName(model) });
++    if (job.stage === "encode") note = t("Saving the instrumental…");
+     else if (p != null) {
+       const li = document.querySelector('#steps li[data-step="separate"] small');
+       li.textContent = `${Math.round(p * 100)}%`;
+       const elapsed = job.now - job.stageStarted;
+-      if (p > 0.04) note += ` · about ${fmtLeft((elapsed / p) * (1 - p))} left`;
+-    } else note += " · loading model";
++      if (p > 0.04) note += t(" · about {time} left", { time: fmtLeft((elapsed / p) * (1 - p)) });
++    } else note += t(" · loading model");
+   } else if (job.stage === "download" && p != null && p < 1) {
+     document.querySelector('#steps li[data-step="download"] small').textContent = `${Math.round(p * 100)}%`;
+-  } else if (job.stage === "transcribe") note = "No lyrics online, listening for the words with Whisper…";
++  } else if (job.stage === "transcribe") note = t("No lyrics online, listening for the words with Whisper…");
+   $("procNote").textContent = note;
+ }
+ const fmtLeft = (s) => (s < 60 ? `${Math.max(5, Math.round(s / 5) * 5)} s` : `${Math.round(s / 60)} min`);
+@@ -368,7 +527,7 @@ $("procStop").onclick = async () => {
+   goHome();
+   if (!job) return;
+   await fetch(`/api/jobs/${job.id}/${job.model}`, { method: "DELETE" }).catch(() => {});
+-  toast("Processing cancelled.");
++  toast(t("Processing cancelled."));
+   refreshQueue();
+ };
+ $("back").onclick = () => goHome();
+@@ -384,8 +543,7 @@ function goHome({ push = true } = {}) {
+ // Browser back/forward moves between the library and songs instead of leaving the app.
+ window.addEventListener("popstate", () => {
+   const q = new URLSearchParams(location.search);
+-  if (q.get("song")) openBundled(q.get("song"), { push: false });
+-  else if (q.get("v")) start(q.get("v"), q.get("m") || settings.model, { push: false });
++  if (q.get("v")) start(q.get("v"), q.get("m") || settings.model, { push: false });
+   else goHome({ push: false });
+ });
+ 
+@@ -412,22 +570,16 @@ function renderLibrary() {
+     const card = document.createElement("button");
+     card.className = "card";
+     card.innerHTML = `<div class="thumb"></div><div class="meta"><div class="t"></div><div class="a"></div><div class="tags"></div></div>`;
+-    const th = card.querySelector(".thumb");
+-    if (it.bundled) {
+-      // Built-in songs have no YouTube video: a stage-light card with the title instead.
+-      th.classList.add("bundled");
+-      th.textContent = it.title;
+-    } else th.style.backgroundImage = `url(${thumb(it.id)})`;
++    card.querySelector(".thumb").style.backgroundImage = `url(${thumb(it.id)})`;
+     card.querySelector(".t").append(...highlight(it.title, words));
+     card.querySelector(".a").append(...highlight(it.artist, words));
+-    card.querySelector(".tags").append(...(it.bundled ? ["Built-in · ready to sing"] : it.stems.map(modelName)).map((label) => {
++    card.querySelector(".tags").append(...it.stems.map(modelName).map((label) => {
+       const t = document.createElement("span");
+       t.className = "tag";
+       t.textContent = label;
+       return t;
+     }));
+-    card.onclick = () => it.bundled ? openBundled(it.id)
+-      : start(it.id, it.stems.includes(settings.model) ? settings.model : it.stems[0]);
++    card.onclick = () => start(it.id, it.stems.includes(settings.model) ? settings.model : it.stems[0]);
+     return card;
+   }));
+ }
+@@ -480,7 +632,7 @@ function load(result, model) {
+   if (!sameSong) {
+     // Nothing from the previous song may linger on screen.
+     shownIdx = -2;
+-    for (const id of ["lPrev", "lCur", "lNext", "countdown"]) $(id).replaceChildren();
++    for (const id of ["lPrev", "lCur", "lNext", "lNext2", "lNext3", "countdown"]) $(id).replaceChildren();
+     $("dur").textContent = $("time").textContent = "0:00";
+   }
+   show("playerView");
+@@ -488,16 +640,15 @@ function load(result, model) {
+   $("nowTitle").textContent = result.title;
+   updateSub();
+   updateOffset(0);
+-  if (!lines.length) $("lCur").textContent = "No lyrics found. Enjoy the instrumental 🎶";
++  if (!lines.length) $("lCur").textContent = t("No lyrics found. Enjoy the instrumental 🎶");
+   if (!sameSong) setupVideo(result.id);
+   switchStems(model, !sameSong);
+   if (!sameSong) window.arcade?.songChanged();
+ }
+ 
+ function updateSub() {
+-  const src = { lrclib: "Lyrics from LRCLIB", whisper: "Lyrics transcribed by Whisper", demo: "Demo track",
+-                bundled: `Built-in song · ${song.license || ""}` }[song.source] || "No lyrics";
+-  $("nowSub").textContent = `${song.artist} · ${src} · ${modelName(currentModel)} model`;
++  const src = t({ lrclib: "Lyrics from LRCLIB", whisper: "Lyrics transcribed by Whisper" }[song.source] || "No lyrics");
++  $("nowSub").textContent = `${song.artist} · ${src} · ${t("{name} model", { name: modelName(currentModel) })}`;
+   // Freely licensed built-in songs carry their attribution, shown under the player.
+   $("credit").textContent = song.credit || "";
+   $("credit").hidden = !song.credit;
+@@ -625,7 +776,7 @@ function setupVideo(id) {
+         // YouTube's own subtitles would duplicate our lyrics; they get re-enabled on each play.
+         onStateChange: (e) => { if (e.data === YT.PlayerState.PLAYING) yt.unloadModule?.("captions"); },
+         // Embedding forbidden by the label, sign-in required, video removed…: cover photo instead.
+-        onError: () => videoFallback("YouTube won't play this video here, so its cover is the backdrop. The karaoke works the same."),
++        onError: () => videoFallback(t("YouTube won't play this video here, so its cover is the backdrop. The karaoke works the same.")),
+       },
+     });
+   };
+@@ -736,7 +887,7 @@ async function videoFallback(message) {
+   // In the desktop app, offer the person's own browser: they're signed in to YouTube there.
+   const desktop = window.stagelightDesktop;
+   toast(message, desktop && {
+-    label: "Open in your browser",
++    label: t("Open in your browser"),
+     run: () => desktop.openInBrowser(location.pathname + location.search),
+   });
+ }
+@@ -771,7 +922,7 @@ setInterval(() => {
+   if (state === YT.PlayerState.PLAYING) videoStuckSince = 0;
+   else if (!videoStuckSince) videoStuckSince = performance.now();
+   else if (performance.now() - videoStuckSince > 7000) {
+-    return videoFallback("YouTube didn't play the video here (it may want you to sign in), so its cover is the backdrop. The karaoke works the same.");
++    return videoFallback(t("YouTube didn't play the video here (it may want you to sign in), so its cover is the backdrop. The karaoke works the same."));
+   }
+   if (state === YT.PlayerState.ENDED) return; // video shorter than the audio: leave it on its last frame
+   if (state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING) yt.playVideo();
+@@ -894,6 +1045,8 @@ function render() {
+     shownIdx = idx;
+     $("lPrev").textContent = lines[idx - 1]?.text || "";
+     $("lNext").textContent = lines[idx + 1]?.text || "";
++    $("lNext2").textContent = lines[idx + 2]?.text || "";
++    $("lNext3").textContent = lines[idx + 3]?.text || "";
+     const cur = $("lCur");
+     cur.replaceChildren();
+     const line = lines[idx];
+@@ -917,7 +1070,7 @@ function render() {
+   // Long intro: tell people when the singing starts instead of an empty screen.
+   if (idx === -1) {
+     const left = lines[0].t - t;
+-    const msg = left > 6 ? `♪ Lyrics in ${fmt(left)}` : "";
++    const msg = left > 6 ? t("♪ Lyrics in {time}", { time: fmt(left) }) : "";
+     if ($("lCur").textContent !== msg) { $("lCur").textContent = msg; $("lCur").classList.toggle("intro", !!msg); }
+   } else $("lCur").classList.remove("intro");
+   // Instrumental break: dim the finished line rather than leaving it lit through a solo.
+@@ -995,7 +1148,7 @@ async function searchSongs(q) {
+   if (!q) return;
+   const token = ++searchToken;
+   $("results").hidden = false;
+-  $("resTitle").textContent = `Results for “${q}”`;
++  $("resTitle").textContent = t("Results for “{q}”", { q });
+   $("resNote").hidden = true;
+   // Placeholder cards while YouTube answers (1–3 s).
+   $("resGrid").replaceChildren(...Array.from({ length: 4 }, () => {
+@@ -1008,11 +1161,11 @@ async function searchSongs(q) {
+   submit.disabled = true;
+   try {
+     const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "Search failed");
++    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || "Search failed"));
+     if (token !== searchToken) return;
+     lastResults = await r.json();
+     renderResults();
+-    if (!lastResults.length) { $("resNote").textContent = "Nothing found. Try the artist and song title."; $("resNote").hidden = false; }
++    if (!lastResults.length) { $("resNote").textContent = t("Nothing found. Try the artist and song title."); $("resNote").hidden = false; }
+     $("results").scrollIntoView({ behavior: "smooth", block: "start" });
+   } catch (err) {
+     if (token !== searchToken) return;
+@@ -1023,7 +1176,7 @@ async function searchSongs(q) {
+     submit.disabled = false;
+   }
+ }
+-$("resClear").onclick = () => { searchToken++; lastResults = []; $("results").hidden = true; $("url").value = ""; $("go").textContent = "Search"; };
++$("resClear").onclick = () => { searchToken++; lastResults = []; $("results").hidden = true; $("url").value = ""; $("go").textContent = t("Search"); };
+ 
+ function renderResults() {
+   if ($("results").hidden) return;
+@@ -1034,7 +1187,7 @@ function renderResults() {
+     const th = card.querySelector(".thumb");
+     th.style.backgroundImage = `url(${thumb(it.id)})`;
+     if (it.duration) th.insertAdjacentHTML("beforeend", `<span class="dur">${fmt(it.duration)}</span>`);
+-    if (it.stems.length) th.insertAdjacentHTML("beforeend", `<span class="badge-in">In library</span>`);
++    if (it.stems.length) th.insertAdjacentHTML("beforeend", `<span class="badge-in">${t("In library")}</span>`);
+     card.querySelector(".t").textContent = it.title;
+     card.querySelector(".t").title = it.title;
+     card.querySelector(".a").textContent = it.channel;
+@@ -1051,7 +1204,7 @@ function resultAction(it) {
+   if (ready) {
+     box.className = "actions";
+     const model = it.stems.includes(settings.model) ? settings.model : (it.stems[0] || job.model);
+-    box.append(button("▶ Sing now", "btn primary", () => start(it.id, model)));
++    box.append(button(t("▶ Sing now"), "btn primary", () => start(it.id, model)));
+   } else if (job) {
+     box.className = "state";
+     box.innerHTML = `<span></span><span class="mini-bar"><i></i></span>`;
+@@ -1060,8 +1213,8 @@ function resultAction(it) {
+   } else {
+     box.className = "actions";
+     box.append(
+-      button("▶ Sing", "btn primary", () => start(it.id, settings.model, { title: it.title })),
+-      button("+ Queue", "btn ghost", () => enqueue(it)),
++      button(t("▶ Sing"), "btn primary", () => start(it.id, settings.model, { title: it.title })),
++      button(t("+ Queue"), "btn ghost", () => enqueue(it)),
+     );
+   }
+   return box;
+@@ -1095,26 +1248,26 @@ async function refreshQueue() {
+ 
+ function jobStatus(j) {
+   const p = j.progress || 0;
+-  if (j.cancel) return { text: "Cancelling…", progress: p };
++  if (j.cancel) return { text: t("Cancelling…"), progress: p };
+   switch (j.stage) {
+     case "queued": {
+       const ahead = queueJobs.filter((o) => !["done", "error", "cancelled"].includes(o.stage)
+         && o !== j && (o.stage !== "queued" || o.seq < j.seq)).length;
+-      return { text: ahead ? `Waiting · ${ahead} ahead` : "Up next", progress: 0 };
++      return { text: ahead ? t("Waiting · {n} ahead", { n: ahead }) : t("Up next"), progress: 0 };
+     }
+-    case "starting": case "download": return { text: "Downloading…", progress: 0.02 };
++    case "starting": case "download": return { text: t("Downloading…"), progress: 0.02 };
+     case "separate": {
+-      let text = `Removing vocals ${Math.round(p * 100)}%`;
++      let text = t("Removing vocals {pct}%", { pct: Math.round(p * 100) });
+       const elapsed = queueNow - j.stageStarted;
+-      if (p > 0.04) text += ` · ${fmtLeft((elapsed / p) * (1 - p))} left`;
++      if (p > 0.04) text += t(" · {time} left", { time: fmtLeft((elapsed / p) * (1 - p)) });
+       return { text, progress: 0.05 + p * 0.85 };
+     }
+-    case "encode": return { text: "Saving…", progress: 0.92 };
+-    case "lyrics": case "align": return { text: "Finding lyrics…", progress: 0.95 };
+-    case "transcribe": return { text: "Transcribing lyrics…", progress: 0.96 };
+-    case "done": return { text: "Ready to sing", progress: 1 };
+-    case "cancelled": return { text: "Removed", progress: 0 };
+-    default: return { text: j.error || "Failed", progress: 0 };
++    case "encode": return { text: t("Saving…"), progress: 0.92 };
++    case "lyrics": case "align": return { text: t("Finding lyrics…"), progress: 0.95 };
++    case "transcribe": return { text: t("Transcribing lyrics…"), progress: 0.96 };
++    case "done": return { text: t("Ready to sing"), progress: 1 };
++    case "cancelled": return { text: t("Removed"), progress: 0 };
++    default: return { text: t(j.error || "Failed"), progress: 0 };
+   }
+ }
+ 
+@@ -1124,28 +1277,28 @@ function renderQueue(busy) {
+   if (!items.length) return;
+   $("queue").classList.toggle("busy", busy);
+   const waiting = items.filter((j) => !["done", "error"].includes(j.stage)).length;
+-  $("queueLabel").textContent = waiting ? `Processing · ${waiting}` : "Queue · all done";
++  $("queueLabel").textContent = waiting ? t("Processing · {n}", { n: waiting }) : t("Queue · all done");
+   $("queueList").replaceChildren(...items.map((j) => {
+     const st = jobStatus(j);
+     const li = document.createElement("li");
+     li.className = `q-item${j.stage === "done" ? " ready" : ""}${j.stage === "error" ? " failed" : ""}`;
+     li.innerHTML = `<img alt=""><div><div class="q-title"></div><div class="q-status"></div><div class="q-bar"><i></i></div></div><span class="q-act"></span>`;
+     li.querySelector("img").src = thumb(j.id);
+-    li.querySelector(".q-title").textContent = j.title || "Fetching title…";
++    li.querySelector(".q-title").textContent = j.title || t("Fetching title…");
+     li.querySelector(".q-status").textContent = st.text;
+     li.querySelector(".q-status").title = st.text;
+     li.querySelector(".q-bar i").style.width = `${Math.round(st.progress * 100)}%`;
+     if (j.stage === "done" || j.stage === "error") li.querySelector(".q-bar").remove();
+     const act = li.querySelector(".q-act");
+-    if (j.stage === "done") act.append(button("▶ Sing", "btn primary", () => start(j.id, j.model)));
+-    else if (j.stage === "error") act.append(button("Retry", "btn ghost", () => start(j.id, j.model, { title: j.title })));
+-    else if (j.stage !== "queued") act.append(button("View", "btn ghost", () => start(j.id, j.model)));
++    if (j.stage === "done") act.append(button(t("▶ Sing"), "btn primary", () => start(j.id, j.model)));
++    else if (j.stage === "error") act.append(button(t("Retry"), "btn ghost", () => start(j.id, j.model, { title: j.title })));
++    else if (j.stage !== "queued") act.append(button(t("View"), "btn ghost", () => start(j.id, j.model)));
+     if (!j.cancel) {
+       const x = button("✕", "x", async () => {
+         await fetch(`/api/jobs/${j.id}/${j.model}`, { method: "DELETE" });
+         refreshQueue();
+       });
+-      x.title = j.stage === "queued" ? "Remove from queue" : ["done", "error"].includes(j.stage) ? "Clear" : "Cancel processing";
++      x.title = t(j.stage === "queued" ? "Remove from queue" : ["done", "error"].includes(j.stage) ? "Clear" : "Cancel processing");
+       act.append(x);
+     }
+     return li;
+@@ -1165,37 +1318,9 @@ applySettings();
+ loadModels().then(() => {
+   loadLibrary();
+   const q = new URLSearchParams(location.search);
+-  if (STATIC || q.has("demo")) openDemo();
+-  else if (q.get("song")) openBundled(q.get("song"), { push: false });
+-  else if (q.get("v")) start(q.get("v"), q.get("m") || settings.model);
++  if (q.get("v")) start(q.get("v"), q.get("m") || settings.model);
+ });
+ 
+-// Built-in songs (freely licensed, already separated and synced, in static/songs/<slug>/): they
+-// open instantly, with no server work. Paths are relative so the same files work at "/" in the
+-// app and at "/demo/" on the website.
+-const DEMO_SONG = "crazy-glue";
+-async function openBundled(slug, { push = true } = {}) {
+-  pollToken++;
+-  const r = await fetch(`songs/${slug}/song.json`);
+-  if (!r.ok) throw new Error(`Built-in song ${slug} not found`);
+-  const result = await r.json();
+-  load(result, result.stems[0]);
+-  if (!STATIC) {
+-    const target = `?song=${slug}`;
+-    if (push && location.search !== target) history.pushState(null, "", target); else history.replaceState(null, "", target);
+-  }
+-  setArt(null);
+-}
+-
+-// "Try the demo": the built-in song, or the tiny synth demo (original lyrics) if it's missing.
+-async function openDemo() {
+-  try { return await openBundled(DEMO_SONG, { push: false }); } catch {}
+-  const result = await (await fetch("demo/demo.json")).json();
+-  load(result, "karaoke");
+-  if (!STATIC) history.replaceState(null, "", "?demo");
+-  setArt(null);
+-}
+-
+ if (STATIC) {
+   // Nothing to search or process on the website: "back" returns to the landing page, and
+   // per-song model switching (which needs the server) is hidden.
+@@ -1208,4 +1333,3 @@ if (STATIC) {
+   // Below the player, in the page flow: a floating banner would cover the controls on short screens.
+   $("playerView").append(cta);
+ }
+-$("demoLink")?.addEventListener("click", (e) => { e.preventDefault(); history.pushState(null, "", "?demo"); openDemo(); });
+diff --git a/static/arcade.js b/static/arcade.js
+index 958f876..4360d17 100644
+--- a/static/arcade.js
++++ b/static/arcade.js
+@@ -25,15 +25,15 @@
+   // ---------------------------------------------------------------- on / off
+ 
+   async function enable() {
+-    if (!song || song.id === "demo") return toast("Arcade needs a real song. Try the built-in one or anything from your library.");
+-    if (!navigator.mediaDevices?.getUserMedia) return toast("This browser can't use the microphone here.");
++    if (!song || song.id === "demo") return toast(t("Arcade needs a real song. Pick one from your library."));
++    if (!navigator.mediaDevices?.getUserMedia) return toast(t("This browser can't use the microphone here."));
+     try {
+       // Echo cancellation keeps the music from the speakers out of the mic as much as it can.
+       stream = await navigator.mediaDevices.getUserMedia({
+         audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+       });
+     } catch {
+-      return toast("Arcade needs your microphone. Allow it for Stagelight in your browser or system settings, then try again.");
++      return toast(t("Arcade needs your microphone. Allow it for Stagelight in your browser or system settings, then try again."));
+     }
+     ctx = new AudioContext();
+     analyser = ctx.createAnalyser();
+@@ -49,7 +49,7 @@
+     $("arcadeBtn").setAttribute("aria-pressed", "true");
+     $("arcadeTop").hidden = false;
+     player.classList.add("arcade");
+-    toast("Arcade on: sing along and hit the notes! Headphones give the most accurate score.");
++    toast(t("Arcade on: sing along and hit the notes! Headphones give the most accurate score."));
+   }
+ 
+   function disable() {
+@@ -65,7 +65,7 @@
+ 
+   async function loadMelody(s) {
+     if (melodies.has(s.id)) return melodies.get(s.id);
+-    if (!s.bundled) toast("Getting the melody ready. The first time takes about half a minute…");
++    if (!s.bundled) toast(t("Getting the melody ready. The first time takes about half a minute…"));
+     try {
+       const r = await fetch(s.bundled ? `songs/${s.id}/melody.json` : `/api/songs/${s.id}/melody`);
+       if (!r.ok) throw new Error();
+@@ -75,7 +75,7 @@
+       melodies.set(s.id, m);
+       return m;
+     } catch {
+-      toast("Couldn't get the melody for this song, so arcade isn't available for it.");
++      toast(t("Couldn't get the melody for this song, so arcade isn't available for it."));
+       return null;
+     }
+   }
+@@ -184,8 +184,8 @@
+ 
+   function showRating(label, points) {
+     const el = $("rating");
+-    $("ratingText").textContent = label === "Miss" ? "Miss" : `${label}!`;
+-    $("ratingPts").textContent = points ? `+${points.toLocaleString("en")}` : "";
++    $("ratingText").textContent = label === "Miss" ? t("Miss") : `${t(label)}!`;
++    $("ratingPts").textContent = points ? `+${points.toLocaleString(LANG)}` : "";
+     el.className = `show r-${label.toLowerCase()}`;
+     clearTimeout(showRating.timer);
+     showRating.timer = setTimeout(() => (el.className = ""), 1100);
+@@ -213,8 +213,8 @@
+     $("resSong").textContent = song.title;
+     $("resRank").textContent = acc >= 0.75 ? "S" : acc >= 0.6 ? "A" : acc >= 0.45 ? "B" : acc >= 0.3 ? "C" : "D";
+     $("resStars").textContent = "★".repeat(stars) + "☆".repeat(5 - stars);
+-    $("resScore").textContent = score.toLocaleString("en");
+-    $("resBest").textContent = record ? (best ? "New best!" : "First score!") : `Best: ${best.toLocaleString("en")}`;
++    $("resScore").textContent = score.toLocaleString(LANG);
++    $("resBest").textContent = record ? t(best ? "New best!" : "First score!") : t("Best: {n}", { n: best.toLocaleString(LANG) });
+     $("resAcc").textContent = `${Math.round(acc * 100)}%`;
+     $("resCombo").textContent = String(bestCombo);
+     $("resPerfect").textContent = String(perfect);
+@@ -291,7 +291,7 @@
+     // The counter runs up to the score instead of jumping.
+     if (shownScore !== score) {
+       shownScore = Math.abs(score - shownScore) < 2 ? score : shownScore + (score - shownScore) * 0.15;
+-      $("score").textContent = Math.round(shownScore).toLocaleString("en");
++      $("score").textContent = Math.round(shownScore).toLocaleString(LANG);
+     }
+     $("micLevel").style.width = `${Math.min(100, micRms * 900)}%`;
+     draw();
+diff --git a/static/i18n.js b/static/i18n.js
+new file mode 100644
+index 0000000..787dc52
+--- /dev/null
++++ b/static/i18n.js
+@@ -0,0 +1,331 @@
++// Interface language. The English text lives in the code and doubles as the key: other languages
++// map it to a translation, so anything missing simply shows in English. "{name}" marks a value
++// filled in at runtime. The choice is the "lang" setting ("auto" follows the system language).
++const LANGS = { en: "English", es: "Español" };
++
++const STRINGS = {
++  es: {
++    // ---- home, search, library
++    "Sing": "Canta",
++    "anything.": "lo que quieras.",
++    "Search for a song or paste a YouTube link. We strip the vocals, find the lyrics and sync them to the music video.":
++      "Busca una canción o pega un enlace de YouTube. Quitamos la voz, buscamos la letra y la sincronizamos con el videoclip.",
++    "Search": "Buscar",
++    "Search a song, or paste a YouTube link": "Busca una canción o pega un enlace de YouTube",
++    "Make it karaoke": "Hacer karaoke",
++    "Vocal removal:": "Quitar voz:",
++    "How the vocals are removed: change it any time in Settings": "Cómo se quita la voz: puedes cambiarlo cuando quieras en Ajustes",
++    "Vocal separation model": "Modelo de separación de voz",
++    "Results": "Resultados",
++    "Results for “{q}”": "Resultados de “{q}”",
++    "Clear": "Borrar",
++    "Your library": "Tu biblioteca",
++    "Library": "Biblioteca",
++    "Search songs or artists ( / )": "Buscar canciones o artistas ( / )",
++    "Search your library": "Buscar en tu biblioteca",
++    "No songs match “": "Ninguna canción coincide con “",
++    "Search failed": "La búsqueda falló",
++    "Nothing found. Try the artist and song title.": "No se encontró nada. Prueba con el artista y el título.",
++    "In library": "En la biblioteca",
++    "▶ Sing now": "▶ Cantar ya",
++    "▶ Sing": "▶ Cantar",
++    "+ Queue": "+ Cola",
++    "Settings (S)": "Ajustes (S)",
++    "Something went wrong": "Algo salió mal",
++
++    // ---- processing
++    "Preparing your track": "Preparando tu canción",
++    "Loading…": "Cargando…",
++    "Download audio": "Descargar audio",
++    "Remove vocals": "Quitar la voz",
++    "Find lyrics": "Buscar la letra",
++    "Sync to video": "Sincronizar con el video",
++    "Keep going in background": "Seguir en segundo plano",
++    "Cancel": "Cancelar",
++    "Close (Esc). Processing keeps going; the song appears in your library when it's ready":
++      "Cerrar (Esc). El proceso sigue; la canción aparecerá en tu biblioteca cuando esté lista",
++    "Processing continues; the song appears in your library when it's ready":
++      "El proceso sigue; la canción aparecerá en tu biblioteca cuando esté lista",
++    "Stop processing this song": "Dejar de procesar esta canción",
++    "Try again": "Reintentar",
++    "Lost connection to the Stagelight server. Is it still running?":
++      "Se perdió la conexión con el servidor de Stagelight. ¿Sigue en marcha?",
++    "Processing cancelled.": "Proceso cancelado.",
++    "Fetching video…": "Obteniendo el video…",
++    "Waiting": "Esperando",
++    "Cancelling…": "Cancelando…",
++    "Waiting for 1 other song…": "Esperando a 1 canción más…",
++    "Waiting for {n} other songs…": "Esperando a {n} canciones más…",
++    "Starting…": "Empezando…",
++    "{name} model": "modelo {name}",
++    "Saving the instrumental…": "Guardando el instrumental…",
++    " · about {time} left": " · quedan unos {time}",
++    " · loading model": " · cargando el modelo",
++    "No lyrics online, listening for the words with Whisper…": "No hay letra en internet; escuchando la voz con Whisper…",
++
++    // ---- queue
++    "Queue": "Cola",
++    "Processing queue": "Cola de procesamiento",
++    "Waiting · {n} ahead": "En espera · {n} delante",
++    "Up next": "La siguiente",
++    "Downloading…": "Descargando…",
++    "Removing vocals {pct}%": "Quitando la voz {pct} %",
++    " · {time} left": " · quedan {time}",
++    "Saving…": "Guardando…",
++    "Finding lyrics…": "Buscando la letra…",
++    "Transcribing lyrics…": "Transcribiendo la letra…",
++    "Ready to sing": "Lista para cantar",
++    "Removed": "Quitada",
++    "Failed": "Falló",
++    "Processing · {n}": "Procesando · {n}",
++    "Queue · all done": "Cola · todo listo",
++    "Fetching title…": "Obteniendo el título…",
++    "Retry": "Reintentar",
++    "View": "Ver",
++    "Remove from queue": "Quitar de la cola",
++    "Cancel processing": "Cancelar el proceso",
++
++    // ---- player
++    "Play (Space)": "Reproducir (Espacio)",
++    "Seek": "Posición",
++    "Mix the original vocal back in: 0% is pure karaoke": "Mezcla de la voz original: 0 % es karaoke puro",
++    "Vocal level": "Nivel de la voz",
++    "Sync": "Sincro",
++    "Lyrics early or late? Nudge them ( [ and ] )": "¿La letra va adelantada o atrasada? Ajústala ( [ y ] )",
++    "Show lyrics earlier": "Mostrar la letra antes",
++    "Show lyrics later": "Mostrar la letra después",
++    "Arcade: sing into the microphone and score points (A)": "Arcade: canta al micrófono y suma puntos (A)",
++    "Fullscreen (F)": "Pantalla completa (F)",
++    "Lyrics from LRCLIB": "Letra de LRCLIB",
++    "Lyrics transcribed by Whisper": "Letra transcrita con Whisper",
++    "No lyrics": "Sin letra",
++    "No lyrics found. Enjoy the instrumental 🎶": "No se encontró la letra. Disfruta del instrumental 🎶",
++    "♪ Lyrics in {time}": "♪ Letra en {time}",
++    "Open in your browser": "Abrir en tu navegador",
++    "YouTube won't play this video here, so its cover is the backdrop. The karaoke works the same.":
++      "YouTube no deja reproducir este video aquí, así que de fondo se ve la portada. El karaoke funciona igual.",
++    "YouTube didn't play the video here (it may want you to sign in), so its cover is the backdrop. The karaoke works the same.":
++      "YouTube no reprodujo el video aquí (puede que pida iniciar sesión), así que de fondo se ve la portada. El karaoke funciona igual.",
++
++    // ---- arcade
++    "Score": "Puntos",
++    "Microphone level": "Nivel del micrófono",
++    "Can't hear you. Sing up!": "No te oigo. ¡Canta más fuerte!",
++    "On pitch": "Afinación",
++    "Best combo": "Mejor combo",
++    "Perfect lines": "Frases perfectas",
++    "Rank": "Rango",
++    "Stars": "Estrellas",
++    "Sing it again": "Cantar otra vez",
++    "Close": "Cerrar",
++    "Perfect": "Perfecto",
++    "Great": "Genial",
++    "Good": "Bien",
++    "Miss": "Fallo",
++    "New best!": "¡Nuevo récord!",
++    "First score!": "¡Primera puntuación!",
++    "Best: {n}": "Récord: {n}",
++    "Arcade needs a real song. Pick one from your library.": "El arcade necesita una canción de verdad. Elige una de tu biblioteca.",
++    "This browser can't use the microphone here.": "Este navegador no puede usar el micrófono aquí.",
++    "Arcade needs your microphone. Allow it for Stagelight in your browser or system settings, then try again.":
++      "El arcade necesita tu micrófono. Permite que Stagelight lo use en los ajustes del navegador o del sistema y vuelve a intentarlo.",
++    "Arcade on: sing along and hit the notes! Headphones give the most accurate score.":
++      "Arcade activado: ¡canta y acierta las notas! Con auriculares la puntuación es más precisa.",
++    "Getting the melody ready. The first time takes about half a minute…":
++      "Preparando la melodía. La primera vez tarda como medio minuto…",
++    "Couldn't get the melody for this song, so arcade isn't available for it.":
++      "No se pudo obtener la melodía de esta canción, así que no hay arcade para ella.",
++
++    // ---- settings
++    "Settings": "Ajustes",
++    "Close (Esc)": "Cerrar (Esc)",
++    "Preview": "Vista previa",
++    "and every word lights up for you": "y cada palabra se ilumina para ti",
++    "Sing along with the stage lights": "Canta bajo las luces del escenario",
++    "Lyrics": "Letra",
++    "Text size": "Tamaño del texto",
++    "Font": "Fuente",
++    "Modern": "Moderna",
++    "Rounded": "Redondeada",
++    "Poster": "Cartel",
++    "Classic": "Clásica",
++    "Highlight style": "Estilo de resaltado",
++    "Wipe": "Barrido",
++    "Pop": "Salto",
++    "Glow": "Brillo",
++    "Line": "Línea",
++    "Colour sweeps through each word": "El color recorre cada palabra",
++    "Each word jumps as it is sung": "Cada palabra salta al cantarla",
++    "Wipe with a neon glow": "Barrido con brillo de neón",
++    "Whole line lights up at once": "Toda la línea se ilumina a la vez",
++    "Highlight colour": "Color de resaltado",
++    "Gold": "Dorado",
++    "Pink": "Rosa",
++    "Cyan": "Cian",
++    "Lime": "Lima",
++    "Violet": "Violeta",
++    "Orange": "Naranja",
++    "Lines on screen": "Líneas en pantalla",
++    "Current": "Actual",
++    "+ Next": "+ Siguiente",
++    "All three": "Las tres",
++    "+3 ahead": "+3 siguientes",
++    "Also show the next three lines: handy for fast songs": "Muestra también las tres líneas siguientes: útil en canciones rápidas",
++    "Position": "Posición",
++    "Bottom": "Abajo",
++    "Center": "Centro",
++    "Bouncing ball": "Pelota que rebota",
++    "Countdown before verses": "Cuenta atrás antes de cada estrofa",
++    "Video": "Video",
++    "Show the music video": "Mostrar el videoclip",
++    "Dim video": "Oscurecer el video",
++    "Blur video": "Desenfocar el video",
++    "Audio": "Audio",
++    "Music volume": "Volumen de la música",
++    "Arcade difficulty": "Dificultad del arcade",
++    "Easy": "Fácil",
++    "Hard": "Difícil",
++    "Within 2 semitones counts": "Vale con 2 semitonos de margen",
++    "Within about a semitone": "Con un semitono de margen, más o menos",
++    "Within half a semitone": "Con medio semitono de margen",
++    "Mic delay (arcade)": "Retardo del micro (arcade)",
++    "Microphones and speakers add a little delay; raise this if you're always scored late":
++      "Micrófonos y altavoces añaden algo de retardo; súbelo si siempre te puntúa tarde",
++    "Language": "Idioma",
++    "Auto": "Automático",
++    "Follow the system language": "Usar el idioma del sistema",
++    "Shortcuts": "Atajos",
++    "Space": "Espacio",
++    "Play / pause": "Reproducir / pausa",
++    "Back / forward 5 s": "Atrás / adelante 5 s",
++    "Lyrics earlier / later": "Letra antes / después",
++    "Fullscreen": "Pantalla completa",
++    "Reset to defaults": "Restablecer ajustes",
++
++    // ---- settings: separation models (names and descriptions come from the server)
++    "Vocal separation": "Separación de voz",
++    "Used for new songs. On this song you can switch to a model that's already processed, or process it again with another one.":
++      "Se usa en las canciones nuevas. En esta canción puedes cambiar a un modelo ya procesado o procesarla de nuevo con otro.",
++    "● Playing on this song": "● Sonando en esta canción",
++    "Switch to this": "Cambiar a este",
++    "ready, instant": "listo, al instante",
++    "Process this song": "Procesar esta canción",
++    "Clean instrumental": "Instrumental limpio",
++    "High quality": "Alta calidad",
++    "Roformer clean": "Roformer limpio",
++    "Removes the lead vocal, keeps backing vocals.": "Quita la voz principal y mantiene los coros.",
++    "Removes every vocal, including harmonies.": "Quita todas las voces, también los coros.",
++    "Cleanest instrumental with fewer artefacts.": "El instrumental más limpio, con menos defectos.",
++    "Best lead-vocal removal, keeps backing vocals. Needs a GPU to be quick.":
++      "La mejor para quitar la voz principal; mantiene los coros. Necesita GPU para ir rápido.",
++    "Best full vocal removal. Needs a GPU to be quick.": "La mejor para quitar todas las voces. Necesita GPU para ir rápido.",
++    "Fast": "Rápido",
++    "Slow": "Lento",
++    "Very slow on CPU": "Muy lento en CPU",
++
++    // ---- settings: lyrics source
++    "Lyrics for this song": "Letra de esta canción",
++    "Artist and song title": "Artista y título",
++    "Search for lyrics": "Buscar letras",
++    "Auto-sync to the vocals": "Sincronizar automáticamente con la voz",
++    "On: shift the lyrics to line up with the singing in this video. Off: use the timings exactly as they come from LRCLIB.":
++      "Activado: desplaza la letra para que cuadre con el canto de este video. Desactivado: usa los tiempos tal cual vienen de LRCLIB.",
++    "Transcribe with Whisper instead (slow)": "Transcribir con Whisper (lento)",
++    "No lyrics yet.": "Todavía no hay letra.",
++    "Now using: a Whisper transcription of the vocals.": "En uso: una transcripción de la voz hecha con Whisper.",
++    "Now using: LRCLIB lyrics with their original timing.": "En uso: letra de LRCLIB con sus tiempos originales.",
++    "Now using: LRCLIB lyrics, auto-synced to the vocals.": "En uso: letra de LRCLIB, sincronizada automáticamente con la voz.",
++    "Looking for lyrics…": "Buscando letras…",
++    "No timed lyrics found on LRCLIB. Try another search, or Whisper.":
++      "No hay letras sincronizadas en LRCLIB. Prueba otra búsqueda o Whisper.",
++    "Couldn't load the lyrics list: {error}": "No se pudo cargar la lista de letras: {error}",
++    "Same length as the video": "Misma duración que el video",
++    "Length difference from the video": "Diferencia de duración con el video",
++    "Listening with Whisper… this can take a few minutes.": "Escuchando con Whisper… puede tardar unos minutos.",
++    "Loading lyrics…": "Cargando la letra…",
++    "Lyrics transcribed by Whisper.": "Letra transcrita con Whisper.",
++    "Lyrics changed.": "Letra cambiada.",
++    "Couldn't change the lyrics: {error}": "No se pudo cambiar la letra: {error}",
++
++    // ---- settings: song storage
++    "Song storage": "Carpeta de canciones",
++    "Where downloaded songs are kept. Takes effect after a restart.":
++      "Dónde se guardan las canciones descargadas. Se aplica al reiniciar.",
++    "Song folder": "Carpeta de canciones",
++    "Save": "Guardar",
++    "Move my songs to the new folder": "Mover mis canciones a la nueva carpeta",
++    "Waiting for a restart. Songs are still in {path}.": "Pendiente de reiniciar. Las canciones siguen en {path}.",
++    "Checking the folder…": "Comprobando la carpeta…",
++    "That's already the song folder.": "Esa ya es la carpeta de canciones.",
++    "Saved. Restarting Stagelight…": "Guardado. Reiniciando Stagelight…",
++    "Saved. Restart Stagelight to start using the new folder.": "Guardado. Reinicia Stagelight para usar la nueva carpeta.",
++
++    // ---- messages from the server
++    "That doesn't look like a YouTube link": "Eso no parece un enlace de YouTube",
++    "Unknown separation model": "Modelo de separación desconocido",
++    "Videos longer than 15 minutes and livestreams aren't supported": "No se admiten videos de más de 15 minutos ni directos",
++    "Job not found (the server may have restarted)": "No se encontró la tarea (puede que el servidor se haya reiniciado)",
++    "This song hasn't been processed yet": "Esta canción aún no se ha procesado",
++    "Couldn't reach LRCLIB": "No se pudo conectar con LRCLIB",
++    "Those lyrics aren't on LRCLIB anymore": "Esa letra ya no está en LRCLIB",
++    "LRCLIB had a problem, try again in a moment": "LRCLIB tuvo un problema; inténtalo de nuevo en un momento",
++    "Pick which lyrics to use": "Elige qué letra usar",
++    "Those lyrics have no timings": "Esa letra no tiene tiempos",
++    "This song has no separated vocals to listen to": "Esta canción no tiene la voz separada para escucharla",
++    "Use a full folder path, like D:\\Karaoke": "Usa la ruta completa de la carpeta, como D:\\Karaoke",
++    "Pick a folder that isn't inside the current one (or the other way round)":
++      "Elige una carpeta que no esté dentro de la actual (ni al revés)",
++    "Removed from the queue": "Quitada de la cola",
++    "Cancelled": "Cancelada",
++    // Messages that start with these keep the rest (the technical detail) as it is.
++    "Couldn't download from YouTube: ": "No se pudo descargar de YouTube: ",
++    "YouTube search failed: ": "La búsqueda en YouTube falló: ",
++    "Can't use that folder: ": "No se puede usar esa carpeta: ",
++  },
++};
++
++const LANG = (() => {
++  let pref = "auto";
++  try { pref = JSON.parse(localStorage.getItem("stagelight.settings"))?.lang || "auto"; } catch {}
++  if (LANGS[pref]) return pref;
++  return /^es\b/i.test(navigator.language || "") ? "es" : "en";
++})();
++document.documentElement.lang = LANG;
++
++function t(text, vars) {
++  if (typeof text !== "string") return text;
++  const table = STRINGS[LANG];
++  let out = text;
++  if (table) {
++    if (table[text] != null) out = table[text];
++    else {
++      // "Prefix: detail" messages from the server: translate the prefix, keep the detail.
++      const i = text.indexOf(": ");
++      if (i > 0 && table[text.slice(0, i + 2)] != null) out = table[text.slice(0, i + 2)] + text.slice(i + 2);
++    }
++  }
++  return vars ? out.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? vars[k] : m)) : out;
++}
++
++// The page's own markup: translate text and a few attributes wherever they match an entry.
++function translatePage(root = document.body) {
++  const table = STRINGS[LANG];
++  if (!table) return;
++  const key = (s) => s.replace(/\s+/g, " ").trim();
++  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
++  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
++    if (n.parentElement?.closest("script, style")) continue;
++    const k = key(n.nodeValue);
++    if (k && table[k] != null) {
++      const [, lead, , trail] = n.nodeValue.match(/^(\s*)([\s\S]*?)(\s*)$/);
++      n.nodeValue = lead + table[k] + trail;
++    }
++  }
++  for (const el of root.querySelectorAll("[title], [placeholder], [aria-label]")) {
++    for (const attr of ["title", "placeholder", "aria-label"]) {
++      const v = el.getAttribute(attr);
++      if (v && table[key(v)] != null) el.setAttribute(attr, table[key(v)]);
++    }
++  }
++}
++translatePage();
+diff --git a/static/index.html b/static/index.html
+index 78cd912..07a9904 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -41,7 +41,6 @@
+       Vocal removal: <select id="modelSelect" aria-label="Vocal separation model"></select>
+     </label>
+     <div id="formError" class="error" hidden></div>
+-    <p class="demo-hint">No song handy? <a id="demoLink" href="?demo">Try the demo</a>, it plays instantly.</p>
+   </div>
+   <div id="results" hidden>
+     <div class="lib-head">
+@@ -101,6 +100,8 @@
+         <div class="line prev" id="lPrev"></div>
+         <div class="line cur" id="lCur"></div>
+         <div class="line next" id="lNext"></div>
++        <div class="line next ahead" id="lNext2"></div>
++        <div class="line next ahead" id="lNext3"></div>
+       </div>
+       <div id="countdown"></div>
+       <div id="bigPlay"><svg><use href="#i-play"/></svg></div>
+@@ -204,6 +205,7 @@
+             <button data-value="1">Current</button>
+             <button data-value="2">+ Next</button>
+             <button data-value="3">All three</button>
++            <button data-value="5" title="Also show the next three lines: handy for fast songs">+3 ahead</button>
+           </div>
+ 
+           <div class="row">Position</div>
+@@ -238,13 +240,45 @@
+           <input id="setMicDelay" class="range" type="range" min="0" max="400" step="10" value="120">
+         </section>
+ 
+-        <section class="set-sep">
++        <div class="set-sep">
++        <section id="lyricSource" class="set-source" hidden>
++          <h4>Lyrics for this song</h4>
++          <p id="srcNow" class="hint"></p>
++          <form id="srcSearch" class="src-search">
++            <input id="srcQuery" type="text" placeholder="Artist and song title" aria-label="Search for lyrics" autocomplete="off">
++            <button class="btn ghost small" type="submit">Search</button>
++          </form>
++          <label class="toggle" title="On: shift the lyrics to line up with the singing in this video. Off: use the timings exactly as they come from LRCLIB.">
++            <span>Auto-sync to the vocals</span><input id="srcAutoSync" type="checkbox" checked><i></i>
++          </label>
++          <p id="srcStatus" class="hint src-status" aria-live="polite"></p>
++          <div id="srcList" class="models src-list"></div>
++          <button id="srcWhisper" class="btn ghost small src-whisper" type="button">Transcribe with Whisper instead (slow)</button>
++        </section>
++        <section>
+           <h4>Vocal separation</h4>
+           <p class="hint">Used for new songs. On this song you can switch to a model that's already processed, or process it again with another one.</p>
+           <div id="modelList" class="models"></div>
+         </section>
++        <section id="storageSection" class="set-storage">
++          <h4>Song storage</h4>
++          <p class="hint">Where downloaded songs are kept. Takes effect after a restart.</p>
++          <form id="storageForm" class="src-search">
++            <input id="storagePath" type="text" aria-label="Song folder" autocomplete="off" spellcheck="false">
++            <button class="btn ghost small" type="submit">Save</button>
++          </form>
++          <label class="toggle"><span>Move my songs to the new folder</span><input id="storageMove" type="checkbox" checked><i></i></label>
++          <p id="storageStatus" class="hint src-status" aria-live="polite"></p>
++        </section>
++        </div>
+ 
+         <section class="set-keys">
++          <h4>Language</h4>
++          <div class="seg set-lang" data-setting="lang">
++            <button data-value="auto" title="Follow the system language">Auto</button>
++            <button data-value="en" lang="en">English</button>
++            <button data-value="es" lang="es">Español</button>
++          </div>
+           <h4>Shortcuts</h4>
+           <dl class="keys">
+             <dt><kbd>Space</kbd></dt><dd>Play / pause</dd>
+@@ -272,6 +306,7 @@
+ <audio id="audio" preload="auto"></audio>
+ <audio id="vocals" preload="auto"></audio>
+ <script src="https://www.youtube.com/iframe_api"></script>
++<script src="i18n.js"></script>
+ <script src="app.js"></script>
+ <script src="arcade.js"></script>
+ </body>
+diff --git a/static/style.css b/static/style.css
+index 60608dd..378726b 100644
+--- a/static/style.css
++++ b/static/style.css
+@@ -69,8 +69,6 @@ svg { width: 1em; height: 1em; display: block; }
+ }
+ .chip select option { background: #15121f; }
+ .error { margin-top: 14px; color: #ff8fa8; font-weight: 500; }
+-.demo-hint { margin: 18px 0 0 !important; font-size: 14px !important; }
+-.demo-hint a { color: var(--text); font-weight: 600; text-decoration-color: var(--accent); text-underline-offset: 3px; }
+ 
+ .range { -webkit-appearance: none; appearance: none; height: 22px; background: transparent; width: 100%; cursor: pointer; }
+ .range::-webkit-slider-runnable-track {
+@@ -292,6 +290,11 @@ body:has(#player:fullscreen) #queue, body:has(#player.fake-fs) #queue { display:
+ /* the extra top margin leaves room for the bouncing ball's arc above the current line */
+ .line.cur { font-size: calc(clamp(22px, 3.9vw, 50px) * var(--scale)); margin: .6em 0 .18em; position: relative; }
+ #stage.lines-1 .line.prev, #stage.lines-1 .line.next, #stage.lines-2 .line.prev { display: none; }
++/* "+3 ahead": two more upcoming lines, fading out, so fast songs can be read ahead */
++.line.ahead { display: none; }
++#stage.lines-5 .line.ahead { display: block; }
++#stage.lines-5 #lNext2 { opacity: .48; }
++#stage.lines-5 #lNext3 { opacity: .34; }
+ .font-poster .line { font-weight: 400; letter-spacing: .03em; line-height: 1.05; }
+ .font-poster .line.cur { font-size: calc(clamp(28px, 4.9vw, 64px) * var(--scale)); }
+ 
+@@ -439,8 +442,24 @@ body:has(#player:fullscreen) #queue, body:has(#player.fake-fs) #queue { display:
+ .model .act { grid-column: 2 / 4; display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 12px; color: var(--muted); }
+ .model .act .btn { padding: 4px 11px; font-size: 12px; }
+ .model .act .playing { color: #8dff6a; font-weight: 600; }
++/* lyrics source picker */
++.set-source { border-bottom: 1px solid var(--border); margin-bottom: 6px; padding-bottom: 18px !important; }
++.src-search { display: flex; gap: 8px; margin: 4px 0 2px; }
++.src-search input {
++  flex: 1; min-width: 0; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border);
++  background: var(--surface); color: var(--text); font: inherit; font-size: 13px;
++}
++.src-search input:focus { outline: none; border-color: var(--accent); }
++.src-status { margin: 10px 0 8px; min-height: 1em; }
++.src-status:empty { display: none; }
++.src-list { max-height: 340px; overflow-y: auto; scrollbar-width: thin; margin-top: 12px; }
++.src-list .model { cursor: pointer; }
++.src-list .model .desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.src-list.busy { opacity: .5; pointer-events: none; }
++.src-whisper { margin-top: 10px; }
+ .keys { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; margin: 0 0 16px; font-size: 13px; }
+ .keys dd { margin: 0; color: var(--muted); }
++.set-lang { margin-bottom: 22px; }
+ kbd { font: 600 11px/1 Outfit, sans-serif; padding: 4px 7px; border-radius: 6px; background: var(--surface-2); border: 1px solid var(--border); border-bottom-width: 2px; }
+ 
+ /* ------------------------------------------------------------ arcade mode */

@@ -5,4 +5,5 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("stagelightDesktop", {
   openInBrowser: (pathAndQuery) => ipcRenderer.send("open-in-browser", String(pathAndQuery || "/")),
+  restart: () => ipcRenderer.send("restart"),
 });

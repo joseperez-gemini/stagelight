@@ -58,9 +58,30 @@
   <div class="note" id="note">One-time setup. Next time Stagelight opens in seconds.</div>
 <script>
   const $ = (id) => document.getElementById(id);
+  // The app passes the interface language in the address (?lang=es).
+  const ES = {
+    "Starting up…": "Arrancando…",
+    "Python runtime": "Entorno de Python",
+    "a private copy, nothing installed system-wide": "una copia propia, no se instala nada en el sistema",
+    "AI engine": "Motor de IA",
+    "vocal separation, lyrics transcription": "separación de voz, transcripción de letras",
+    "Start": "Inicio",
+    "opening Stagelight": "abriendo Stagelight",
+    "Try again": "Reintentar",
+    "Open log": "Abrir el registro",
+    "One-time setup. Next time Stagelight opens in seconds.": "Configuración inicial, solo una vez. La próxima vez Stagelight se abre en segundos.",
+    "Setting up the AI engine (first launch only)": "Instalando el motor de IA (solo la primera vez)",
+    "Starting Stagelight…": "Iniciando Stagelight…",
+  };
+  const es = new URLSearchParams(location.search).get("lang") === "es";
+  const tr = (s) => (es && ES[s]) || s;
+  if (es) {
+    document.documentElement.lang = "es";
+    document.querySelectorAll("h1, b, small, button, .note").forEach((el) => { el.textContent = tr(el.textContent); });
+  }
   const lines = [];
   const MAX = 14;
-  stagelight.on("first-run", () => { $("headline").textContent = "Setting up the AI engine (first launch only)"; });
+  stagelight.on("first-run", () => { $("headline").textContent = tr("Setting up the AI engine (first launch only)"); });
   stagelight.on("log", (line) => {
     lines.push(line);
     if (lines.length > MAX) lines.shift();
@@ -71,7 +92,7 @@
     li.className = state;
     if (detail && id === "packages") $("pkgDetail").textContent = detail;
     if (detail && id === "start") $("startDetail").textContent = detail;
-    if (id === "start" && state === "active") $("headline").textContent = "Starting Stagelight…";
+    if (id === "start" && state === "active") $("headline").textContent = tr("Starting Stagelight…");
   });
   stagelight.on("failed", ({ message }) => {
     $("fail").style.display = "block";

@@ -10,7 +10,7 @@ const thumb = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
 const DEFAULTS = {
   size: 100, font: "modern", anim: "wipe", color: "#ffd447", lines: "3", position: "bottom",
   ball: true, countdown: true, dim: 15, blur: false, music: 100, vocal: 0, model: "karaoke", video: true,
-  difficulty: "normal", micDelay: 120,
+  difficulty: "normal", micDelay: 120, lang: "auto",
 };
 const FONTS = {
   modern: "Outfit, system-ui, sans-serif",
@@ -30,6 +30,13 @@ function saveSettings() {
 let saveSettingsTimer;
 function set(key, value) {
   settings[key] = value;
+  // The page's text is translated once, at load: a new language means a reload.
+  if (key === "lang") {
+    saveSettings();
+    if (!STATIC) fetch("/api/lang", { method: "POST", keepalive: true, headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ lang: value }) }).catch(() => {});
+    return location.reload();
+  }
   clearTimeout(saveSettingsTimer);
   saveSettingsTimer = setTimeout(saveSettings, 300);
   // Volumes change on every slider tick: keep that path cheap and don't touch the lyric DOM.
@@ -111,7 +118,7 @@ $("seek").addEventListener("input", (e) => {
 });
 $("seek").addEventListener("change", () => { commitSeek(); scrubbing = false; $("seek").blur(); });
 function commitSeek() { if (isFinite(audio.duration)) audio.currentTime = seekTarget(); }
-$("resetSettings").onclick = () => { settings = { ...DEFAULTS, model: settings.model }; saveSettings(); applySettings(); };
+$("resetSettings").onclick = () => { settings = { ...DEFAULTS, model: settings.model, lang: settings.lang }; saveSettings(); applySettings(); };
 $("modelSelect").addEventListener("change", (e) => set("model", e.target.value));
 
 const player = $("player");
@@ -125,7 +132,7 @@ function hostSettings() {
 }
 const openSettings = (open = !settingsOpen()) => {
   const drawer = $("settings");
-  if (open) { hostSettings(); renderPreview(); }
+  if (open) { hostSettings(); renderPreview(); refreshLyricSource(); loadStorage(); }
   drawer.classList.toggle("open", open);
   player.classList.toggle("settings-open", open);
   drawer.inert = !open; // keep Tab out of the panel while it's closed
@@ -141,7 +148,7 @@ $("closeSettings").onclick = () => openSettings(false);
 
 // Live preview at the top of the settings: a sample line in the chosen font, size, colour and
 // highlight style, frozen mid-line (two words sung, one being sung), with the ball above it.
-const PREVIEW_WORDS = ["Sing", "along", "with", "the", "stage", "lights"];
+const PREVIEW_WORDS = t("Sing along with the stage lights").split(" ");
 function renderPreview() {
   const stage = $("previewStage"), cur = $("previewCur");
   stage.className = `preview-stage anim-${settings.anim} font-${settings.font} lines-${settings.lines}`;
@@ -176,11 +183,11 @@ async function loadModels() {
     : await (await fetch("/api/models")).json();
   models = data.models;
   if (!models.some((m) => m.key === settings.model)) settings.model = data.default;
-  $("modelSelect").replaceChildren(...models.map((m) => new Option(`${m.name} · ${m.speed.toLowerCase()}`, m.key)));
+  $("modelSelect").replaceChildren(...models.map((m) => new Option(`${t(m.name)} · ${t(m.speed).toLowerCase()}`, m.key)));
   $("modelSelect").value = settings.model;
   renderModels();
 }
-const modelName = (key) => models.find((m) => m.key === key)?.name || key;
+const modelName = (key) => t(models.find((m) => m.key === key)?.name || key);
 
 function renderModels() {
   const list = $("modelList");
@@ -192,18 +199,19 @@ function renderModels() {
     el.tabIndex = 0;
     el.innerHTML = `<span class="radio"></span><span class="name"></span><span class="speed ${m.speed.toLowerCase()}"></span>
       <span class="desc"></span><span class="act"></span>`;
-    el.querySelector(".name").textContent = m.name;
-    el.querySelector(".speed").textContent = m.speed;
-    el.querySelector(".desc").textContent = m.desc;
+    el.querySelector(".name").textContent = t(m.name);
+    el.querySelector(".speed").textContent = t(m.speed);
+    el.querySelector(".desc").textContent = t(m.desc);
     const act = el.querySelector(".act");
     if (song) {
       if (m.key === currentModel) {
-        act.innerHTML = `<span class="playing">● Playing on this song</span>`;
+        act.innerHTML = `<span class="playing"></span>`;
+        act.firstChild.textContent = t("● Playing on this song");
       } else if (song.stems.includes(m.key)) {
-        const b = button("Switch to this", "btn ghost", () => switchStems(m.key));
-        act.append(b, "ready, instant");
+        const b = button(t("Switch to this"), "btn ghost", () => switchStems(m.key));
+        act.append(b, t("ready, instant"));
       } else {
-        act.append(button("Process this song", "btn ghost", () => start(song.id, m.key)));
+        act.append(button(t("Process this song"), "btn ghost", () => start(song.id, m.key)));
       }
     }
     el.onclick = () => set("model", m.key);
@@ -217,6 +225,155 @@ function button(label, cls, onclick) {
   b.onclick = (e) => { e.stopPropagation(); onclick(); };
   return b;
 }
+
+// ============================================================ lyrics source
+
+// Which lyrics a processed song uses: another LRCLIB version, LRCLIB's timings as they are
+// (auto-sync off), or a Whisper transcription. Lives in the settings drawer.
+let srcData = null, srcFor = null, srcBusy = false;
+const canPickLyrics = () => !STATIC && !!song && !song.bundled;
+const srcStatus = (text) => { $("srcStatus").textContent = text || ""; };
+
+function renderSrcNow() {
+  if (!song) return;
+  $("srcNow").textContent = t(!song.lines?.length ? "No lyrics yet."
+    : song.source === "whisper" ? "Now using: a Whisper transcription of the vocals."
+    : song.autoSync === false ? "Now using: LRCLIB lyrics with their original timing."
+    : "Now using: LRCLIB lyrics, auto-synced to the vocals.");
+  $("srcAutoSync").checked = song.autoSync !== false;
+}
+
+async function refreshLyricSource(query = null) {
+  const box = $("lyricSource");
+  box.hidden = !canPickLyrics();
+  if (box.hidden) return;
+  renderSrcNow();
+  if (!query && srcFor === song.id && srcData) return renderSrcList();
+  const id = song.id;
+  srcStatus(t("Looking for lyrics…"));
+  $("srcList").replaceChildren();
+  try {
+    const r = await fetch(`/api/songs/${id}/lyrics${query ? `?q=${encodeURIComponent(query)}` : ""}`);
+    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || r.statusText));
+    const data = await r.json();
+    if (song?.id !== id) return;
+    srcData = data;
+    srcFor = id;
+    if (!query) $("srcQuery").value = data.query;
+    srcStatus(data.candidates.length ? "" : t("No timed lyrics found on LRCLIB. Try another search, or Whisper."));
+    renderSrcList();
+  } catch (e) {
+    if (song?.id === id) srcStatus(t("Couldn't load the lyrics list: {error}", { error: e.message }));
+  }
+}
+
+function renderSrcList() {
+  const cur = song.source === "lrclib" ? song.lrclibId : null;
+  $("srcList").replaceChildren(...srcData.candidates.map((c) => {
+    const el = document.createElement("div");
+    el.className = `model${c.id === cur ? " on" : ""}`;
+    el.setAttribute("role", "button");
+    el.tabIndex = 0;
+    el.innerHTML = `<span class="radio"></span><span class="name"></span><span class="speed"></span><span class="desc"></span>`;
+    el.querySelector(".name").textContent = `${c.artist} – ${c.title}`;
+    // Length next to the video's: a version of the same length usually lines up best.
+    const sp = el.querySelector(".speed");
+    const d = c.duration ? Math.round(c.duration - srcData.duration) : null;
+    sp.textContent = c.duration ? fmt(c.duration) + (d != null && Math.abs(d) > 2 ? ` (${d > 0 ? "+" : "−"}${Math.abs(d)}s)` : "") : "?";
+    sp.title = d == null ? "" : t(Math.abs(d) <= 2 ? "Same length as the video" : "Length difference from the video");
+    if (d != null && Math.abs(d) <= 2) sp.classList.add("fast");
+    const desc = el.querySelector(".desc");
+    desc.textContent = [c.album, c.preview].filter(Boolean).join(" · ");
+    desc.title = c.preview || "";
+    const pick = () => chooseLyrics({ source: "lrclib", id: c.id, autoSync: $("srcAutoSync").checked });
+    el.onclick = pick;
+    el.onkeydown = (e) => { if (e.key === "Enter") pick(); };
+    return el;
+  }));
+}
+
+async function chooseLyrics(body) {
+  if (srcBusy || !song) return;
+  const id = song.id;
+  srcBusy = true;
+  $("srcList").classList.add("busy");
+  $("srcWhisper").disabled = $("srcAutoSync").disabled = true;
+  srcStatus(t(body.source === "whisper" ? "Listening with Whisper… this can take a few minutes." : "Loading lyrics…"));
+  try {
+    const r = await fetch(`/api/songs/${id}/lyrics`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || r.statusText));
+    const result = await r.json();
+    if (song?.id !== id) return;
+    // Swap the lyrics in place: the music keeps playing where it was.
+    song = result;
+    offset = result.offset || 0;
+    lines = result.lines.map(withWords);
+    shownIdx = -2;
+    updateSub();
+    updateOffset(0);
+    if (!lines.length) $("lCur").textContent = t("No lyrics found. Enjoy the instrumental 🎶");
+    srcStatus("");
+    toast(t(body.source === "whisper" ? "Lyrics transcribed by Whisper." : "Lyrics changed."));
+  } catch (e) {
+    srcStatus(t("Couldn't change the lyrics: {error}", { error: e.message }));
+  } finally {
+    srcBusy = false;
+    $("srcList").classList.remove("busy");
+    $("srcWhisper").disabled = $("srcAutoSync").disabled = false;
+    if (song?.id === id) { renderSrcNow(); if (srcData && srcFor === id) renderSrcList(); }
+  }
+}
+
+$("srcSearch").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const q = $("srcQuery").value.trim();
+  if (q) refreshLyricSource(q);
+});
+$("srcWhisper").onclick = () => chooseLyrics({ source: "whisper" });
+// Flipping auto-sync re-applies the lyrics in use, so its effect shows right away.
+$("srcAutoSync").addEventListener("change", (e) => {
+  if (song?.source === "lrclib" && song.lrclibId) chooseLyrics({ source: "lrclib", id: song.lrclibId, autoSync: e.target.checked });
+});
+
+// ============================================================ song storage
+
+// Where the server keeps songs. Changing it is saved on the server and applied on the next start,
+// when the songs are moved over too (the desktop app restarts itself).
+let storageLoaded = false;
+async function loadStorage() {
+  if (STATIC || storageLoaded) return;
+  try {
+    const d = await (await fetch("/api/storage")).json();
+    $("storagePath").value = d.next;
+    $("storagePath").placeholder = d.default;
+    $("storageStatus").textContent = d.next !== d.path ? t("Waiting for a restart. Songs are still in {path}.", { path: d.path }) : "";
+    storageLoaded = true;
+  } catch {}
+}
+$("storageForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const status = $("storageStatus");
+  status.textContent = t("Checking the folder…");
+  try {
+    const r = await fetch("/api/storage", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: $("storagePath").value, move: $("storageMove").checked }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(t(d.detail || r.statusText));
+    $("storagePath").value = d.path;
+    if (!d.restart) { status.textContent = t("That's already the song folder."); return; }
+    if (window.stagelightDesktop?.restart) {
+      status.textContent = t("Saved. Restarting Stagelight…");
+      setTimeout(() => window.stagelightDesktop.restart(), 800);
+    } else status.textContent = t("Saved. Restart Stagelight to start using the new folder.");
+  } catch (err) {
+    status.textContent = err.message;
+  }
+});
+if (STATIC) $("storageSection").hidden = true;
 
 // ============================================================ views & jobs
 
@@ -238,7 +395,7 @@ $("form").addEventListener("submit", (e) => {
   else searchSongs(q);
 });
 $("url").addEventListener("input", () => {
-  $("go").textContent = looksLikeLink($("url").value) ? "Make it karaoke" : "Search";
+  $("go").textContent = t(looksLikeLink($("url").value) ? "Make it karaoke" : "Search");
 });
 
 let pollToken = 0;
@@ -254,7 +411,7 @@ async function start(url, model, { push = true, title = null } = {}) {
     const r = await fetch("/api/jobs", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url, model, title }),
     });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "Something went wrong");
+    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || "Something went wrong"));
     const { id } = await r.json();
     const target = `?v=${id}&m=${model}`;
     if (push && location.search !== target) history.pushState(null, "", target);
@@ -272,7 +429,7 @@ $("url").addEventListener("input", () => { $("formError").hidden = true; });
 
 function showProcError(message) {
   $("procError").replaceChildren(message, document.createElement("br"),
-    button("Try again", "btn ghost small", () => start(lastRequest.url, lastRequest.model, { push: false })));
+    button(t("Try again"), "btn ghost small", () => start(lastRequest.url, lastRequest.model, { push: false })));
   $("procError").hidden = false;
   $("barFill").classList.remove("indeterminate");
   const active = document.querySelector("#steps li.active");
@@ -298,14 +455,14 @@ async function poll(id, model, token) {
       job = await r.json();
       failures = 0;
     } catch {
-      if (++failures > 10) throw new Error("Lost connection to the Stagelight server. Is it still running?");
+      if (++failures > 10) throw new Error(t("Lost connection to the Stagelight server. Is it still running?"));
       await new Promise((r) => setTimeout(r, 1500));
       continue;
     }
     if (token !== pollToken) return;
     if (job.stage === "done") { document.title = "Stagelight Karaoke"; return load(job.result, model); }
-    if (job.stage === "cancelled") { goHome(); return toast("Processing cancelled."); }
-    if (job.stage === "error") throw new Error(job.error);
+    if (job.stage === "cancelled") { goHome(); return toast(t("Processing cancelled.")); }
+    if (job.stage === "error") throw new Error(t(job.error));
     procJob = { id, model };
     if (first) {
       first = false;
@@ -313,7 +470,7 @@ async function poll(id, model, token) {
       setArt(id);
       $("procThumb").src = thumb(id);
       $("procError").hidden = true;
-      $("procTitle").textContent = "Fetching video…";
+      $("procTitle").textContent = t("Fetching video…");
     }
     renderProgress(job, model);
     await new Promise((r) => setTimeout(r, 1000));
@@ -334,27 +491,29 @@ function renderProgress(job, model) {
   const p = job.progress;
   // Visible in the browser tab while you do something else during the wait.
   document.title = `${p != null && step === "separate" ? Math.round(p * 100) + "% · " : ""}${
-    step ? $(`steps`).querySelector(`[data-step="${step}"] span`).textContent : "Waiting"} · Stagelight`;
+    step ? $(`steps`).querySelector(`[data-step="${step}"] span`).textContent : t("Waiting")} · Stagelight`;
   const fill = $("barFill");
   fill.classList.toggle("indeterminate", p == null);
   fill.style.width = `${(p || 0) * 100}%`;
 
   let note = "";
   $("procStop").disabled = !!job.cancel;
-  if (job.cancel) note = "Cancelling…";
-  else if (job.stage === "queued") note = job.queuePos ? `Waiting for ${job.queuePos} other song${job.queuePos > 1 ? "s" : ""}…` : "Starting…";
-  else if (step === "separate") {
-    note = `${modelName(model)} model`;
-    if (job.stage === "encode") note = "Saving the instrumental…";
+  if (job.cancel) note = t("Cancelling…");
+  else if (job.stage === "queued") {
+    note = !job.queuePos ? t("Starting…") : job.queuePos === 1 ? t("Waiting for 1 other song…")
+      : t("Waiting for {n} other songs…", { n: job.queuePos });
+  } else if (step === "separate") {
+    note = t("{name} model", { name: modelName(model) });
+    if (job.stage === "encode") note = t("Saving the instrumental…");
     else if (p != null) {
       const li = document.querySelector('#steps li[data-step="separate"] small');
       li.textContent = `${Math.round(p * 100)}%`;
       const elapsed = job.now - job.stageStarted;
-      if (p > 0.04) note += ` · about ${fmtLeft((elapsed / p) * (1 - p))} left`;
-    } else note += " · loading model";
+      if (p > 0.04) note += t(" · about {time} left", { time: fmtLeft((elapsed / p) * (1 - p)) });
+    } else note += t(" · loading model");
   } else if (job.stage === "download" && p != null && p < 1) {
     document.querySelector('#steps li[data-step="download"] small').textContent = `${Math.round(p * 100)}%`;
-  } else if (job.stage === "transcribe") note = "No lyrics online, listening for the words with Whisper…";
+  } else if (job.stage === "transcribe") note = t("No lyrics online, listening for the words with Whisper…");
   $("procNote").textContent = note;
 }
 const fmtLeft = (s) => (s < 60 ? `${Math.max(5, Math.round(s / 5) * 5)} s` : `${Math.round(s / 60)} min`);
@@ -368,7 +527,7 @@ $("procStop").onclick = async () => {
   goHome();
   if (!job) return;
   await fetch(`/api/jobs/${job.id}/${job.model}`, { method: "DELETE" }).catch(() => {});
-  toast("Processing cancelled.");
+  toast(t("Processing cancelled."));
   refreshQueue();
 };
 $("back").onclick = () => goHome();
@@ -384,8 +543,7 @@ function goHome({ push = true } = {}) {
 // Browser back/forward moves between the library and songs instead of leaving the app.
 window.addEventListener("popstate", () => {
   const q = new URLSearchParams(location.search);
-  if (q.get("song")) openBundled(q.get("song"), { push: false });
-  else if (q.get("v")) start(q.get("v"), q.get("m") || settings.model, { push: false });
+  if (q.get("v")) start(q.get("v"), q.get("m") || settings.model, { push: false });
   else goHome({ push: false });
 });
 
@@ -412,22 +570,16 @@ function renderLibrary() {
     const card = document.createElement("button");
     card.className = "card";
     card.innerHTML = `<div class="thumb"></div><div class="meta"><div class="t"></div><div class="a"></div><div class="tags"></div></div>`;
-    const th = card.querySelector(".thumb");
-    if (it.bundled) {
-      // Built-in songs have no YouTube video: a stage-light card with the title instead.
-      th.classList.add("bundled");
-      th.textContent = it.title;
-    } else th.style.backgroundImage = `url(${thumb(it.id)})`;
+    card.querySelector(".thumb").style.backgroundImage = `url(${thumb(it.id)})`;
     card.querySelector(".t").append(...highlight(it.title, words));
     card.querySelector(".a").append(...highlight(it.artist, words));
-    card.querySelector(".tags").append(...(it.bundled ? ["Built-in · ready to sing"] : it.stems.map(modelName)).map((label) => {
+    card.querySelector(".tags").append(...it.stems.map(modelName).map((label) => {
       const t = document.createElement("span");
       t.className = "tag";
       t.textContent = label;
       return t;
     }));
-    card.onclick = () => it.bundled ? openBundled(it.id)
-      : start(it.id, it.stems.includes(settings.model) ? settings.model : it.stems[0]);
+    card.onclick = () => start(it.id, it.stems.includes(settings.model) ? settings.model : it.stems[0]);
     return card;
   }));
 }
@@ -480,7 +632,7 @@ function load(result, model) {
   if (!sameSong) {
     // Nothing from the previous song may linger on screen.
     shownIdx = -2;
-    for (const id of ["lPrev", "lCur", "lNext", "countdown"]) $(id).replaceChildren();
+    for (const id of ["lPrev", "lCur", "lNext", "lNext2", "lNext3", "countdown"]) $(id).replaceChildren();
     $("dur").textContent = $("time").textContent = "0:00";
   }
   show("playerView");
@@ -488,16 +640,15 @@ function load(result, model) {
   $("nowTitle").textContent = result.title;
   updateSub();
   updateOffset(0);
-  if (!lines.length) $("lCur").textContent = "No lyrics found. Enjoy the instrumental 🎶";
+  if (!lines.length) $("lCur").textContent = t("No lyrics found. Enjoy the instrumental 🎶");
   if (!sameSong) setupVideo(result.id);
   switchStems(model, !sameSong);
   if (!sameSong) window.arcade?.songChanged();
 }
 
 function updateSub() {
-  const src = { lrclib: "Lyrics from LRCLIB", whisper: "Lyrics transcribed by Whisper", demo: "Demo track",
-                bundled: `Built-in song · ${song.license || ""}` }[song.source] || "No lyrics";
-  $("nowSub").textContent = `${song.artist} · ${src} · ${modelName(currentModel)} model`;
+  const src = t({ lrclib: "Lyrics from LRCLIB", whisper: "Lyrics transcribed by Whisper" }[song.source] || "No lyrics");
+  $("nowSub").textContent = `${song.artist} · ${src} · ${t("{name} model", { name: modelName(currentModel) })}`;
   // Freely licensed built-in songs carry their attribution, shown under the player.
   $("credit").textContent = song.credit || "";
   $("credit").hidden = !song.credit;
@@ -625,7 +776,7 @@ function setupVideo(id) {
         // YouTube's own subtitles would duplicate our lyrics; they get re-enabled on each play.
         onStateChange: (e) => { if (e.data === YT.PlayerState.PLAYING) yt.unloadModule?.("captions"); },
         // Embedding forbidden by the label, sign-in required, video removed…: cover photo instead.
-        onError: () => videoFallback("YouTube won't play this video here, so its cover is the backdrop. The karaoke works the same."),
+        onError: () => videoFallback(t("YouTube won't play this video here, so its cover is the backdrop. The karaoke works the same.")),
       },
     });
   };
@@ -736,7 +887,7 @@ async function videoFallback(message) {
   // In the desktop app, offer the person's own browser: they're signed in to YouTube there.
   const desktop = window.stagelightDesktop;
   toast(message, desktop && {
-    label: "Open in your browser",
+    label: t("Open in your browser"),
     run: () => desktop.openInBrowser(location.pathname + location.search),
   });
 }
@@ -771,7 +922,7 @@ setInterval(() => {
   if (state === YT.PlayerState.PLAYING) videoStuckSince = 0;
   else if (!videoStuckSince) videoStuckSince = performance.now();
   else if (performance.now() - videoStuckSince > 7000) {
-    return videoFallback("YouTube didn't play the video here (it may want you to sign in), so its cover is the backdrop. The karaoke works the same.");
+    return videoFallback(t("YouTube didn't play the video here (it may want you to sign in), so its cover is the backdrop. The karaoke works the same."));
   }
   if (state === YT.PlayerState.ENDED) return; // video shorter than the audio: leave it on its last frame
   if (state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING) yt.playVideo();
@@ -894,6 +1045,8 @@ function render() {
     shownIdx = idx;
     $("lPrev").textContent = lines[idx - 1]?.text || "";
     $("lNext").textContent = lines[idx + 1]?.text || "";
+    $("lNext2").textContent = lines[idx + 2]?.text || "";
+    $("lNext3").textContent = lines[idx + 3]?.text || "";
     const cur = $("lCur");
     cur.replaceChildren();
     const line = lines[idx];
@@ -917,7 +1070,7 @@ function render() {
   // Long intro: tell people when the singing starts instead of an empty screen.
   if (idx === -1) {
     const left = lines[0].t - t;
-    const msg = left > 6 ? `♪ Lyrics in ${fmt(left)}` : "";
+    const msg = left > 6 ? t("♪ Lyrics in {time}", { time: fmt(left) }) : "";
     if ($("lCur").textContent !== msg) { $("lCur").textContent = msg; $("lCur").classList.toggle("intro", !!msg); }
   } else $("lCur").classList.remove("intro");
   // Instrumental break: dim the finished line rather than leaving it lit through a solo.
@@ -995,7 +1148,7 @@ async function searchSongs(q) {
   if (!q) return;
   const token = ++searchToken;
   $("results").hidden = false;
-  $("resTitle").textContent = `Results for “${q}”`;
+  $("resTitle").textContent = t("Results for “{q}”", { q });
   $("resNote").hidden = true;
   // Placeholder cards while YouTube answers (1–3 s).
   $("resGrid").replaceChildren(...Array.from({ length: 4 }, () => {
@@ -1008,11 +1161,11 @@ async function searchSongs(q) {
   submit.disabled = true;
   try {
     const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "Search failed");
+    if (!r.ok) throw new Error(t((await r.json().catch(() => ({}))).detail || "Search failed"));
     if (token !== searchToken) return;
     lastResults = await r.json();
     renderResults();
-    if (!lastResults.length) { $("resNote").textContent = "Nothing found. Try the artist and song title."; $("resNote").hidden = false; }
+    if (!lastResults.length) { $("resNote").textContent = t("Nothing found. Try the artist and song title."); $("resNote").hidden = false; }
     $("results").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (err) {
     if (token !== searchToken) return;
@@ -1023,7 +1176,7 @@ async function searchSongs(q) {
     submit.disabled = false;
   }
 }
-$("resClear").onclick = () => { searchToken++; lastResults = []; $("results").hidden = true; $("url").value = ""; $("go").textContent = "Search"; };
+$("resClear").onclick = () => { searchToken++; lastResults = []; $("results").hidden = true; $("url").value = ""; $("go").textContent = t("Search"); };
 
 function renderResults() {
   if ($("results").hidden) return;
@@ -1034,7 +1187,7 @@ function renderResults() {
     const th = card.querySelector(".thumb");
     th.style.backgroundImage = `url(${thumb(it.id)})`;
     if (it.duration) th.insertAdjacentHTML("beforeend", `<span class="dur">${fmt(it.duration)}</span>`);
-    if (it.stems.length) th.insertAdjacentHTML("beforeend", `<span class="badge-in">In library</span>`);
+    if (it.stems.length) th.insertAdjacentHTML("beforeend", `<span class="badge-in">${t("In library")}</span>`);
     card.querySelector(".t").textContent = it.title;
     card.querySelector(".t").title = it.title;
     card.querySelector(".a").textContent = it.channel;
@@ -1051,7 +1204,7 @@ function resultAction(it) {
   if (ready) {
     box.className = "actions";
     const model = it.stems.includes(settings.model) ? settings.model : (it.stems[0] || job.model);
-    box.append(button("▶ Sing now", "btn primary", () => start(it.id, model)));
+    box.append(button(t("▶ Sing now"), "btn primary", () => start(it.id, model)));
   } else if (job) {
     box.className = "state";
     box.innerHTML = `<span></span><span class="mini-bar"><i></i></span>`;
@@ -1060,8 +1213,8 @@ function resultAction(it) {
   } else {
     box.className = "actions";
     box.append(
-      button("▶ Sing", "btn primary", () => start(it.id, settings.model, { title: it.title })),
-      button("+ Queue", "btn ghost", () => enqueue(it)),
+      button(t("▶ Sing"), "btn primary", () => start(it.id, settings.model, { title: it.title })),
+      button(t("+ Queue"), "btn ghost", () => enqueue(it)),
     );
   }
   return box;
@@ -1095,26 +1248,26 @@ async function refreshQueue() {
 
 function jobStatus(j) {
   const p = j.progress || 0;
-  if (j.cancel) return { text: "Cancelling…", progress: p };
+  if (j.cancel) return { text: t("Cancelling…"), progress: p };
   switch (j.stage) {
     case "queued": {
       const ahead = queueJobs.filter((o) => !["done", "error", "cancelled"].includes(o.stage)
         && o !== j && (o.stage !== "queued" || o.seq < j.seq)).length;
-      return { text: ahead ? `Waiting · ${ahead} ahead` : "Up next", progress: 0 };
+      return { text: ahead ? t("Waiting · {n} ahead", { n: ahead }) : t("Up next"), progress: 0 };
     }
-    case "starting": case "download": return { text: "Downloading…", progress: 0.02 };
+    case "starting": case "download": return { text: t("Downloading…"), progress: 0.02 };
     case "separate": {
-      let text = `Removing vocals ${Math.round(p * 100)}%`;
+      let text = t("Removing vocals {pct}%", { pct: Math.round(p * 100) });
       const elapsed = queueNow - j.stageStarted;
-      if (p > 0.04) text += ` · ${fmtLeft((elapsed / p) * (1 - p))} left`;
+      if (p > 0.04) text += t(" · {time} left", { time: fmtLeft((elapsed / p) * (1 - p)) });
       return { text, progress: 0.05 + p * 0.85 };
     }
-    case "encode": return { text: "Saving…", progress: 0.92 };
-    case "lyrics": case "align": return { text: "Finding lyrics…", progress: 0.95 };
-    case "transcribe": return { text: "Transcribing lyrics…", progress: 0.96 };
-    case "done": return { text: "Ready to sing", progress: 1 };
-    case "cancelled": return { text: "Removed", progress: 0 };
-    default: return { text: j.error || "Failed", progress: 0 };
+    case "encode": return { text: t("Saving…"), progress: 0.92 };
+    case "lyrics": case "align": return { text: t("Finding lyrics…"), progress: 0.95 };
+    case "transcribe": return { text: t("Transcribing lyrics…"), progress: 0.96 };
+    case "done": return { text: t("Ready to sing"), progress: 1 };
+    case "cancelled": return { text: t("Removed"), progress: 0 };
+    default: return { text: t(j.error || "Failed"), progress: 0 };
   }
 }
 
@@ -1124,28 +1277,28 @@ function renderQueue(busy) {
   if (!items.length) return;
   $("queue").classList.toggle("busy", busy);
   const waiting = items.filter((j) => !["done", "error"].includes(j.stage)).length;
-  $("queueLabel").textContent = waiting ? `Processing · ${waiting}` : "Queue · all done";
+  $("queueLabel").textContent = waiting ? t("Processing · {n}", { n: waiting }) : t("Queue · all done");
   $("queueList").replaceChildren(...items.map((j) => {
     const st = jobStatus(j);
     const li = document.createElement("li");
     li.className = `q-item${j.stage === "done" ? " ready" : ""}${j.stage === "error" ? " failed" : ""}`;
     li.innerHTML = `<img alt=""><div><div class="q-title"></div><div class="q-status"></div><div class="q-bar"><i></i></div></div><span class="q-act"></span>`;
     li.querySelector("img").src = thumb(j.id);
-    li.querySelector(".q-title").textContent = j.title || "Fetching title…";
+    li.querySelector(".q-title").textContent = j.title || t("Fetching title…");
     li.querySelector(".q-status").textContent = st.text;
     li.querySelector(".q-status").title = st.text;
     li.querySelector(".q-bar i").style.width = `${Math.round(st.progress * 100)}%`;
     if (j.stage === "done" || j.stage === "error") li.querySelector(".q-bar").remove();
     const act = li.querySelector(".q-act");
-    if (j.stage === "done") act.append(button("▶ Sing", "btn primary", () => start(j.id, j.model)));
-    else if (j.stage === "error") act.append(button("Retry", "btn ghost", () => start(j.id, j.model, { title: j.title })));
-    else if (j.stage !== "queued") act.append(button("View", "btn ghost", () => start(j.id, j.model)));
+    if (j.stage === "done") act.append(button(t("▶ Sing"), "btn primary", () => start(j.id, j.model)));
+    else if (j.stage === "error") act.append(button(t("Retry"), "btn ghost", () => start(j.id, j.model, { title: j.title })));
+    else if (j.stage !== "queued") act.append(button(t("View"), "btn ghost", () => start(j.id, j.model)));
     if (!j.cancel) {
       const x = button("✕", "x", async () => {
         await fetch(`/api/jobs/${j.id}/${j.model}`, { method: "DELETE" });
         refreshQueue();
       });
-      x.title = j.stage === "queued" ? "Remove from queue" : ["done", "error"].includes(j.stage) ? "Clear" : "Cancel processing";
+      x.title = t(j.stage === "queued" ? "Remove from queue" : ["done", "error"].includes(j.stage) ? "Clear" : "Cancel processing");
       act.append(x);
     }
     return li;
@@ -1165,36 +1318,8 @@ applySettings();
 loadModels().then(() => {
   loadLibrary();
   const q = new URLSearchParams(location.search);
-  if (STATIC || q.has("demo")) openDemo();
-  else if (q.get("song")) openBundled(q.get("song"), { push: false });
-  else if (q.get("v")) start(q.get("v"), q.get("m") || settings.model);
+  if (q.get("v")) start(q.get("v"), q.get("m") || settings.model);
 });
-
-// Built-in songs (freely licensed, already separated and synced, in static/songs/<slug>/): they
-// open instantly, with no server work. Paths are relative so the same files work at "/" in the
-// app and at "/demo/" on the website.
-const DEMO_SONG = "crazy-glue";
-async function openBundled(slug, { push = true } = {}) {
-  pollToken++;
-  const r = await fetch(`songs/${slug}/song.json`);
-  if (!r.ok) throw new Error(`Built-in song ${slug} not found`);
-  const result = await r.json();
-  load(result, result.stems[0]);
-  if (!STATIC) {
-    const target = `?song=${slug}`;
-    if (push && location.search !== target) history.pushState(null, "", target); else history.replaceState(null, "", target);
-  }
-  setArt(null);
-}
-
-// "Try the demo": the built-in song, or the tiny synth demo (original lyrics) if it's missing.
-async function openDemo() {
-  try { return await openBundled(DEMO_SONG, { push: false }); } catch {}
-  const result = await (await fetch("demo/demo.json")).json();
-  load(result, "karaoke");
-  if (!STATIC) history.replaceState(null, "", "?demo");
-  setArt(null);
-}
 
 if (STATIC) {
   // Nothing to search or process on the website: "back" returns to the landing page, and
@@ -1208,4 +1333,3 @@ if (STATIC) {
   // Below the player, in the page flow: a floating banner would cover the controls on short screens.
   $("playerView").append(cta);
 }
-$("demoLink")?.addEventListener("click", (e) => { e.preventDefault(); history.pushState(null, "", "?demo"); openDemo(); });

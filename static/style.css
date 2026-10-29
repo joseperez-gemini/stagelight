@@ -69,8 +69,6 @@ svg { width: 1em; height: 1em; display: block; }
 }
 .chip select option { background: #15121f; }
 .error { margin-top: 14px; color: #ff8fa8; font-weight: 500; }
-.demo-hint { margin: 18px 0 0 !important; font-size: 14px !important; }
-.demo-hint a { color: var(--text); font-weight: 600; text-decoration-color: var(--accent); text-underline-offset: 3px; }
 
 .range { -webkit-appearance: none; appearance: none; height: 22px; background: transparent; width: 100%; cursor: pointer; }
 .range::-webkit-slider-runnable-track {
@@ -292,6 +290,11 @@ body:has(#player:fullscreen) #queue, body:has(#player.fake-fs) #queue { display:
 /* the extra top margin leaves room for the bouncing ball's arc above the current line */
 .line.cur { font-size: calc(clamp(22px, 3.9vw, 50px) * var(--scale)); margin: .6em 0 .18em; position: relative; }
 #stage.lines-1 .line.prev, #stage.lines-1 .line.next, #stage.lines-2 .line.prev { display: none; }
+/* "+3 ahead": two more upcoming lines, fading out, so fast songs can be read ahead */
+.line.ahead { display: none; }
+#stage.lines-5 .line.ahead { display: block; }
+#stage.lines-5 #lNext2 { opacity: .48; }
+#stage.lines-5 #lNext3 { opacity: .34; }
 .font-poster .line { font-weight: 400; letter-spacing: .03em; line-height: 1.05; }
 .font-poster .line.cur { font-size: calc(clamp(28px, 4.9vw, 64px) * var(--scale)); }
 
@@ -439,8 +442,24 @@ body:has(#player:fullscreen) #queue, body:has(#player.fake-fs) #queue { display:
 .model .act { grid-column: 2 / 4; display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 12px; color: var(--muted); }
 .model .act .btn { padding: 4px 11px; font-size: 12px; }
 .model .act .playing { color: #8dff6a; font-weight: 600; }
+/* lyrics source picker */
+.set-source { border-bottom: 1px solid var(--border); margin-bottom: 6px; padding-bottom: 18px !important; }
+.src-search { display: flex; gap: 8px; margin: 4px 0 2px; }
+.src-search input {
+  flex: 1; min-width: 0; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); font: inherit; font-size: 13px;
+}
+.src-search input:focus { outline: none; border-color: var(--accent); }
+.src-status { margin: 10px 0 8px; min-height: 1em; }
+.src-status:empty { display: none; }
+.src-list { max-height: 340px; overflow-y: auto; scrollbar-width: thin; margin-top: 12px; }
+.src-list .model { cursor: pointer; }
+.src-list .model .desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.src-list.busy { opacity: .5; pointer-events: none; }
+.src-whisper { margin-top: 10px; }
 .keys { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; margin: 0 0 16px; font-size: 13px; }
 .keys dd { margin: 0; color: var(--muted); }
+.set-lang { margin-bottom: 22px; }
 kbd { font: 600 11px/1 Outfit, sans-serif; padding: 4px 7px; border-radius: 6px; background: var(--surface-2); border: 1px solid var(--border); border-bottom-width: 2px; }
 
 /* ------------------------------------------------------------ arcade mode */
